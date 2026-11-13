@@ -6,6 +6,7 @@ Recorder 1.3.0 на Telegram X 0.29.1.1819 опубликован. main, call-re
 ## Реализация
 - Сохранены package ka.soft.tgxr, прежняя подпись, формат записей, PCM hooks, режимы записи, пауза, восстановление, воспроизведение и экспорт.
 - Upstream c26c0efa; Recorder tgcalls 29e43315, WebRTC 7b03082. Зависимости закреплены в Git.
+- С 2026-11-13 tgcalls не сабмодуль: он импортирован через git subtree в app/jni/tgvoip/third_party/tgcalls (дерево идентично 29e43315). TGCALLS_COMMIT в BuildConfig теперь показывает коммит самого Recorder.
 - Три Release APK: tens для Android 7–9, qrs для Android 10–12, latest для Android 13+; каждый включает ARM32 и ARM64.
 
 ## Проверки и ограничения

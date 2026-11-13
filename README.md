@@ -31,7 +31,9 @@
 
 * `main` — опубликованный релиз, каждая версия отмечена тегом `tgxr-vX.Y.Z`.
 * `dev` — разработка. Обновления Telegram X вливаются сюда из [TGX-Android/Telegram-X](https://github.com/TGX-Android/Telegram-X), после проверки `main` догоняет `dev`.
-* Хуки записи звука в библиотеке звонков лежат в форке [YevhenKarpiuk/tgcalls](https://github.com/YevhenKarpiuk/tgcalls) (ветка `recorder`), он подключён сабмодулем.
+* Библиотека звонков tgcalls с хуками записи звука лежит прямо в репозитории, в `app/jni/tgvoip/third_party/tgcalls` (импортирована через `git subtree` с полной историей). Обновление из upstream:
+  `git subtree pull --prefix=app/jni/tgvoip/third_party/tgcalls https://github.com/TGX-Android/tgcalls production`
+  Старый форк [YevhenKarpiuk/tgcalls](https://github.com/YevhenKarpiuk/tgcalls) нужен только для сборки релизов до 1.3.0 включительно.
 
 Сборка такая же, как у Telegram X (инструкция ниже). Идентификатор и имя приложения задаются в `local.properties`: `app.id=ka.soft.tgxr`, `app.name=Telegram X Recorder`.
 
