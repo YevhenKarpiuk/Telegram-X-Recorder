@@ -30,6 +30,7 @@ import androidx.annotation.IntDef;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.UiThread;
+import androidx.collection.SparseArrayCompat;
 
 import org.drinkless.tdlib.Client;
 import org.drinkless.tdlib.TdApi;
@@ -577,7 +578,7 @@ public class Settings {
     }
 
     private boolean checkLogSetting (int flag) {
-      if (BuildConfig.GENERATING_BASELINE_PROFILE) {
+      if (BuildConfig.TEST_HOOKS_ENABLED) {
         if (flag == FLAG_TDLIB_OTHER_ENABLE_ANDROID_LOG) {
           return true;
         }
@@ -842,7 +843,7 @@ public class Settings {
   private Settings () {
     File pmcDir = new File(AppContext.get().getFilesDir(), "pmc");
     boolean didNotExist = !pmcDir.exists();
-    if (Config.ENABLE_BASELINE_PROFILE_HOOKS && didNotExist) {
+    if (Config.ENABLE_TEST_HOOKS && didNotExist) {
       if (SessionSnapshot.restoreSnapshot()) {
         didNotExist = false;
       }
@@ -4737,7 +4738,7 @@ public class Settings {
       case TdApi.ProxyTypeMtproto.CONSTRUCTOR:
         return null;
       default: {
-        Td.assertProxyType_bc1a1076();
+        Td.assertProxyType_40673e07();
         throw Td.unsupported(type);
       }
     }
@@ -4752,7 +4753,7 @@ public class Settings {
       case TdApi.ProxyTypeMtproto.CONSTRUCTOR:
         return null;
       default: {
-        Td.assertProxyType_bc1a1076();
+        Td.assertProxyType_40673e07();
         throw Td.unsupported(type);
       }
     }
@@ -4767,7 +4768,7 @@ public class Settings {
       case TdApi.ProxyTypeHttp.CONSTRUCTOR:
         return 3;
       default:
-        Td.assertProxyType_bc1a1076();
+        Td.assertProxyType_40673e07();
         throw Td.unsupported(type);
     }
   }
@@ -4781,7 +4782,7 @@ public class Settings {
       case TdApi.ProxyTypeHttp.CONSTRUCTOR:
         return Proxy.TYPE_HTTP;
       default:
-        Td.assertProxyType_bc1a1076();
+        Td.assertProxyType_40673e07();
         throw Td.unsupported(type);
     }
   }
@@ -5140,7 +5141,7 @@ public class Settings {
           stringRes = R.string.ProxyHttp;
           break;
         default:
-          Td.assertProxyType_bc1a1076();
+          Td.assertProxyType_40673e07();
           throw Td.unsupported(proxy.type);
       }
       return Lang.getString(stringRes, (target, argStart, argEnd, argIndex, needFakeBold) -> new CustomTypefaceSpan(null, ColorId.textLight), name);
@@ -5221,6 +5222,8 @@ public class Settings {
 
   private @NonNull List<Proxy> loadAvailableProxies () {
     List<Proxy> proxies = new ArrayList<>();
+    // Configs come before names and statistics by the order of keys
+    SparseArrayCompat<Proxy> proxiesById = new SparseArrayCompat<>();
     Blob blob = null;
     int[] order = pmc.getIntArray(KEY_PROXY_ORDER);
     for (final LevelDB.Entry entry : pmc.find(KEY_PROXY_ITEM_PREFIX)) {
@@ -5247,33 +5250,36 @@ public class Settings {
         if (proxy != null) {
           proxy.order = order != null ? ArrayUtils.indexOf(order, proxyId) : Proxy.ORDER_UNSET;
           proxies.add(proxy);
+          proxiesById.put(proxyId, proxy);
         } else {
           Log.w("Removing proxy configuration, because it cannot be read, proxyId:%d", proxyId);
           removeProxy(proxyId);
         }
-      } else if (!proxies.isEmpty()) {
-        Proxy lastProxy = proxies.get(proxies.size() - 1);
-        if (lastProxy.id == proxyId) {
+      } else {
+        Proxy proxy = proxiesById.get(proxyId);
+        if (proxy != null) {
           try {
-            switch (key) {
+            switch (subKey) {
               case KEY_PROXY_PREFIX_DESCRIPTION: {
-                lastProxy.description = entry.asString();
+                proxy.description = entry.asString();
                 break;
               }
               case KEY_PROXY_PREFIX_CONNECTED_COUNT: {
-                lastProxy.successfulConnectionsCount = entry.asInt();
+                proxy.successfulConnectionsCount = entry.asInt();
                 break;
               }
               case KEY_PROXY_PREFIX_LAST_CONNECTION: {
                 long[] lastConnectionInfo = entry.asLongArray();
-                lastProxy.lastConnectionTime = lastConnectionInfo.length > 0 ? lastConnectionInfo[0] : 0;
-                lastProxy.lastConnectionDuration = lastConnectionInfo.length > 1 ? lastConnectionInfo[1] : 0;
+                proxy.lastConnectionTime =
+                  lastConnectionInfo.length > 0 ? lastConnectionInfo[0] : 0;
+                proxy.lastConnectionDuration =
+                  lastConnectionInfo.length > 1 ? lastConnectionInfo[1] : 0;
                 break;
               }
               case KEY_PROXY_PREFIX_LAST_PING: {
                 long[] lastPingInfo = entry.asLongArray();
-                lastProxy.lastPingTime = lastPingInfo.length > 0 ? lastPingInfo[0] : 0;
-                lastProxy.lastPingResult = lastPingInfo.length > 1 ? lastPingInfo[1] : 0;
+                proxy.lastPingTime = lastPingInfo.length > 0 ? lastPingInfo[0] : 0;
+                proxy.lastPingResult = lastPingInfo.length > 1 ? lastPingInfo[1] : 0;
                 break;
               }
             }

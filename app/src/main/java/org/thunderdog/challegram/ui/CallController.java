@@ -40,6 +40,7 @@ import androidx.annotation.Nullable;
 import org.drinkless.tdlib.TdApi;
 import org.thunderdog.challegram.BaseActivity;
 import org.thunderdog.challegram.BuildConfig;
+import org.thunderdog.challegram.CallActivity;
 import org.thunderdog.challegram.Log;
 import org.thunderdog.challegram.R;
 import org.thunderdog.challegram.U;
@@ -73,6 +74,8 @@ import org.thunderdog.challegram.widget.EmojiTextView;
 import org.thunderdog.challegram.widget.TextView;
 import org.thunderdog.challegram.widget.voip.CallControlsLayout;
 
+import java.util.concurrent.TimeUnit;
+
 import me.vkryl.android.AnimatorUtils;
 import me.vkryl.android.ScrimUtil;
 import me.vkryl.android.ViewUtils;
@@ -83,6 +86,7 @@ import me.vkryl.android.widget.FrameLayoutFix;
 import me.vkryl.core.ColorUtils;
 import me.vkryl.core.MathUtils;
 import me.vkryl.core.StringUtils;
+import tgx.td.ChatId;
 
 public class CallController extends ViewController<CallController.Arguments> implements TdlibCache.UserDataChangeListener, TdlibCache.CallStateChangeListener, View.OnClickListener, FactorAnimator.Target, Runnable, CallControlsLayout.CallControlCallback, Screen.StatusBarHeightChangeListener, TGCallService.CallRecordingListener {
   private static final boolean DEBUG_FADE_BRANDING = true;
@@ -285,6 +289,10 @@ public class CallController extends ViewController<CallController.Arguments> imp
   private ButtonView muteButtonView, speakerButtonView;
 
   private float lastHeaderFactor;
+
+  public void showWithoutTransition () {
+    applyCustomHeaderAnimations(1f);
+  }
 
   @Override
   protected void applyCustomHeaderAnimations (float factor) {
@@ -645,7 +653,7 @@ public class CallController extends ViewController<CallController.Arguments> imp
 
     // Answer controls
 
-    callControlsLayout = new CallControlsLayout(context, this);
+    callControlsLayout = new CallControlsLayout(context);
     Views.setPaddingBottom(callControlsLayout, extraBottomInset);
     callControlsLayout.setCallback(this);
     callControlsLayout.setLayoutParams(FrameLayoutFix.newParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
@@ -779,6 +787,16 @@ public class CallController extends ViewController<CallController.Arguments> imp
     if (!UI.isTablet()) {
       context().setOrientation(BaseActivity.getAndroidOrientationPortrait());
     }
+    // Also once the passcode is entered, before the screens show again
+    if (!isClosed && isMissedUnderPasscode() && !TD.isFreshMissedCall(
+      tdlib.chat(ChatId.fromUserId(call.userId)), tdlib.currentTime(TimeUnit.SECONDS))) {
+      closeCall();
+    }
+  }
+
+  private boolean isMissedUnderPasscode () {
+    return TD.isMissed(call) && context().isPasscodeShowing() &&
+      !(context() instanceof CallActivity);
   }
 
   @Override
@@ -971,7 +989,11 @@ public class CallController extends ViewController<CallController.Arguments> imp
         callSettings.setMicMuted(((ButtonView) v).toggleActive());
       }
     } else if (viewId == R.id.btn_openChat) {
-      tdlib.ui().openPrivateChat(this, call.userId, null);
+      if (context() instanceof CallActivity) {
+        ((CallActivity) context()).openApp(true);
+      } else {
+        tdlib.ui().openPrivateChat(this, call.userId, null);
+      }
     } else if (viewId == R.id.btn_speaker) {
       if (!TD.isFinished(call)) {
         if (callSettings == null) {
@@ -1016,7 +1038,9 @@ public class CallController extends ViewController<CallController.Arguments> imp
   private void closeCall () {
     isClosed = true;
     tdlib.cache().unsubscribeFromCallUpdates(call.id, this);
-    navigateBack();
+    if (!navigateBack() && context() instanceof CallActivity) {
+      context().finish();
+    }
   }
 
   private TdApi.CallState previousCallState;
@@ -1034,7 +1058,11 @@ public class CallController extends ViewController<CallController.Arguments> imp
     setCallBarsCount(tdlib.context().calls().getCallBarsCount(tdlib, call.id));
     updateCallStrength();
     updateCallRecordingUi();
-    if (TD.isCancelled(call) || TD.isAcceptedOnOtherDevice(call) || TD.isDeclined(call) || (prevIsActive && callEnded) || TD.isMissed(call) || call.state.getConstructor() == TdApi.CallStateHangingUp.CONSTRUCTOR) {
+    if (isMissedUnderPasscode()) {
+      callControlsLayout.setCall(tdlib, call, false);
+    } else if (TD.isCancelled(call) || TD.isAcceptedOnOtherDevice(call) || TD.isDeclined(call) ||
+      (prevIsActive && callEnded) || TD.isMissed(call) ||
+      call.state.getConstructor() == TdApi.CallStateHangingUp.CONSTRUCTOR) {
       closeCall();
     } else {
       callControlsLayout.setCall(tdlib, call, navigationController != null);
@@ -1117,7 +1145,13 @@ public class CallController extends ViewController<CallController.Arguments> imp
       }
     }
     stateView.setText(Lang.uppercase(str));
-    setButtonsVisible(!TD.isFinished(call) && !(call.state.getConstructor() == TdApi.CallStatePending.CONSTRUCTOR && !call.isOutgoing), isFocused());
+    boolean isEnded = call.state.getConstructor() == TdApi.CallStateDiscarded.CONSTRUCTOR ||
+      call.state.getConstructor() == TdApi.CallStateError.CONSTRUCTOR;
+    boolean isIncoming = call.state.getConstructor() == TdApi.CallStatePending.CONSTRUCTOR &&
+      !call.isOutgoing;
+    setButtonsVisible(isEnded || (!TD.isFinished(call) && !isIncoming), isFocused());
+    muteButtonView.setVisibility(isEnded ? View.INVISIBLE : View.VISIBLE);
+    speakerButtonView.setVisibility(isEnded ? View.INVISIBLE : View.VISIBLE);
     updateEmoji();
     updateFlashing();
     updateCallStrength();
@@ -1304,6 +1338,13 @@ public class CallController extends ViewController<CallController.Arguments> imp
       oneShot = true;
     }
     tdlib.context().calls().acknowledgeCurrentCall(call.id);
+    TGCallService.checkIncomingNotification();
+  }
+
+  @Override
+  public void onBlur () {
+    super.onBlur();
+    TGCallService.checkIncomingNotification();
   }
 
   @Override
@@ -1337,6 +1378,7 @@ public class CallController extends ViewController<CallController.Arguments> imp
       recordingService.removeCallRecordingListener(this);
       recordingService = null;
     }
+    TGCallService.checkIncomingNotification();
   }
 
   @Override

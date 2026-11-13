@@ -56,6 +56,7 @@ import org.thunderdog.challegram.navigation.MoreDelegate;
 import org.thunderdog.challegram.navigation.NavigationController;
 import org.thunderdog.challegram.navigation.ViewController;
 import org.thunderdog.challegram.support.ViewSupport;
+import org.thunderdog.challegram.telegram.CallProblems;
 import org.thunderdog.challegram.telegram.ConnectionListener;
 import org.thunderdog.challegram.telegram.GlobalTokenStateListener;
 import org.thunderdog.challegram.telegram.SessionListener;
@@ -334,6 +335,13 @@ public class SettingsController extends ViewController<Void> implements
     long oldProblematicChatId = this.problematicChatId;
     boolean hasNotificationError = tdlib.notifications().hasLocalNotificationProblem();
     int notificationErrorDescriptionRes = hasNotificationError ? getNotificationErrorDescription() : 0;
+    @CallProblems.Type int callProblem = CallProblems.get(tdlib);
+    if (callProblem != CallProblems.Type.NONE &&
+      !tdlib.notifications().areNotificationsBlockedGlobally()) {
+      hasNotificationError = true;
+      notificationErrorDescriptionRes = CallProblems.getDescription(callProblem);
+      this.problematicChatId = 0;
+    }
     boolean hadDescription = this.notificationErrorDescriptionRes != 0;
     boolean hasDescription = notificationErrorDescriptionRes != 0;
 
@@ -1444,7 +1452,7 @@ public class SettingsController extends ViewController<Void> implements
     }
 
     SpannableStringBuilder b = new SpannableStringBuilder();
-    b.append(Lang.getMarkdownStringSecure(this, R.string.AppSignature, BuildConfig.VERSION_NAME));
+    b.append(Lang.getMarkdownStringSecure(this, R.string.AppSignature, U.getVersionName()));
 
     showOptions(b, ids.get(), strings.get(), colors.get(), icons.get(), (itemView, id) -> {
       if (id == R.id.btn_copyText) {

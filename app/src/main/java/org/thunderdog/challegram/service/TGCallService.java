@@ -15,6 +15,7 @@
 package org.thunderdog.challegram.service;
 
 import android.Manifest;
+import android.app.KeyguardManager;
 import android.app.Notification;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
@@ -28,7 +29,6 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.pm.PackageManager;
-import android.content.pm.ServiceInfo;
 import android.graphics.Bitmap;
 import android.hardware.Sensor;
 import android.hardware.SensorEvent;
@@ -42,6 +42,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
+import android.os.Process;
 import android.os.Vibrator;
 import android.telephony.TelephonyManager;
 import android.text.SpannableString;
@@ -51,30 +52,35 @@ import android.view.KeyEvent;
 import androidx.annotation.DrawableRes;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.annotation.RequiresApi;
 import androidx.core.app.NotificationManagerCompat;
+import androidx.core.content.ContextCompat;
 
 import org.drinkless.tdlib.TdApi;
-import org.thunderdog.challegram.BuildConfig;
+import org.thunderdog.challegram.BaseActivity;
 import org.thunderdog.challegram.Log;
 import org.thunderdog.challegram.R;
 import org.thunderdog.challegram.U;
 import org.thunderdog.challegram.core.Lang;
 import org.thunderdog.challegram.data.TD;
+import org.thunderdog.challegram.navigation.ViewController;
 import org.thunderdog.challegram.player.TGPlayerController;
 import org.thunderdog.challegram.receiver.VoIPMediaButtonReceiver;
+import org.thunderdog.challegram.telegram.CallManager;
 import org.thunderdog.challegram.telegram.PrivateCallListener;
 import org.thunderdog.challegram.telegram.Tdlib;
 import org.thunderdog.challegram.telegram.TdlibAccount;
 import org.thunderdog.challegram.telegram.TdlibCache;
 import org.thunderdog.challegram.telegram.TdlibManager;
-import org.thunderdog.challegram.telegram.TdlibNotificationChannelGroup;
 import org.thunderdog.challegram.telegram.TdlibNotificationManager;
 import org.thunderdog.challegram.telegram.TdlibNotificationUtils;
 import org.thunderdog.challegram.theme.ColorId;
 import org.thunderdog.challegram.theme.Theme;
 import org.thunderdog.challegram.tool.Intents;
 import org.thunderdog.challegram.tool.UI;
+import org.thunderdog.challegram.ui.CallController;
 import org.thunderdog.challegram.unsorted.AppContext;
+import org.thunderdog.challegram.unsorted.Passcode;
 import org.thunderdog.challegram.unsorted.Settings;
 import org.thunderdog.challegram.util.SoundPoolMap;
 import org.thunderdog.challegram.voip.ConnectionStateListener;
@@ -83,8 +89,8 @@ import org.thunderdog.challegram.voip.Socks5Proxy;
 import org.thunderdog.challegram.voip.VoIP;
 import org.thunderdog.challegram.voip.VoIPInstance;
 import org.thunderdog.challegram.voip.annotation.CallNetworkType;
-import org.thunderdog.challegram.voip.annotation.CallState;
 import org.thunderdog.challegram.voip.annotation.CallRecordingState;
+import org.thunderdog.challegram.voip.annotation.CallState;
 import org.thunderdog.challegram.voip.gui.CallSettings;
 import org.thunderdog.challegram.voip.gui.VoIPFeedbackActivity;
 
@@ -102,7 +108,7 @@ import tgx.td.ChatId;
 public class TGCallService extends Service implements
   TdlibCache.CallStateChangeListener,
   AudioManager.OnAudioFocusChangeListener,
-  SensorEventListener, UI.StateListener {
+  SensorEventListener, UI.StateListener, Passcode.LockListener {
   @Override
   public IBinder onBind (Intent intent) {
     return null;
@@ -110,18 +116,16 @@ public class TGCallService extends Service implements
 
   private @Nullable Tdlib tdlib;
   private @Nullable TdApi.Call call;
-  private @Nullable String callChannelId;
   private TdApi.User user;
 
   private boolean callInitialized;
-  private boolean incomingAnswerRequested;
-  private @CallForegroundStateMachine.State int foregroundState = CallForegroundStateMachine.State.NONE;
 
   @Override
   public int onStartCommand (Intent intent, int flags, int startId) {
     if (Log.isEnabled(Log.TAG_VOIP)) {
       Log.i(Log.TAG_VOIP, "TGCallService.onStartCommand received, intent: %s", intent);
     }
+    startForegroundAtOnce();
     final int oldCallId = callId();
     int accountId, callId;
     if (intent != null) {
@@ -138,6 +142,8 @@ public class TGCallService extends Service implements
     }
     if (call == null || user == null) {
       Log.w(Log.TAG_VOIP, "TGCallService.onStartCommand: failed because call or other party not found, call: %s, user: %s", call, user);
+      U.stopForeground(this, true, TdlibNotificationManager.ID_FOREGROUND_CALL_START);
+      isForegroundPlaceholderShown = false;
       stopSelf();
       return START_NOT_STICKY;
     }
@@ -149,6 +155,46 @@ public class TGCallService extends Service implements
     }
     updateCall(call);
     return START_NOT_STICKY;
+  }
+
+  private boolean isForegroundPlaceholderShown;
+  private Notification foregroundPlaceholder;
+
+  private void startForegroundAtOnce () {
+    // Android 8+ needs startForeground in time even for a call that is gone. Under its own id, as
+    // System UI opens a full-screen intent only for a notification that is added, not updated
+    if (incomingNotification != null || ongoingCallNotification != null) {
+      return;
+    }
+    Notification.Builder builder;
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      builder = new Notification.Builder(this, U.getOtherNotificationChannel());
+    } else {
+      builder = new Notification.Builder(this);
+    }
+    builder
+      .setContentTitle(Lang.getString(R.string.VoipBranding))
+      .setSmallIcon(CALL_ICON_RES)
+      .setContentIntent(PendingIntent.getActivity(UI.getContext(),
+        Intents.REQUEST_CODE_CALL_SCREEN, Intents.valueOfCallInApp(false),
+        PendingIntent.FLAG_ONE_SHOT | Intents.mutabilityFlags(false)));
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+      builder.setCategory(Notification.CATEGORY_CALL);
+    }
+    Notification notification;
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
+      notification = builder.build();
+    } else {
+      notification = builder.getNotification();
+    }
+    try {
+      U.startForeground(this, TdlibNotificationManager.ID_FOREGROUND_CALL_START, notification,
+        false);
+      foregroundPlaceholder = notification;
+      isForegroundPlaceholderShown = true;
+    } catch (Throwable t) {
+      Log.e(Log.TAG_VOIP, "Unable to start the service of calls in foreground", t);
+    }
   }
 
   public int callId () {
@@ -293,6 +339,15 @@ public class TGCallService extends Service implements
         return;
       }
 
+      if (Intent.ACTION_SCREEN_OFF.equals(action) || Intent.ACTION_SCREEN_ON.equals(action) ||
+        Intent.ACTION_USER_PRESENT.equals(action)) {
+        boolean isPhoneLocked = Passcode.instance().isLockedForIncomingCalls() && isPhoneLocked();
+        if (incomingNotification != null && incomingNotificationPhoneLocked != isPhoneLocked) {
+          showIncomingNotification(true);
+        }
+        return;
+      }
+
       if (Intents.ACTION_DECLINE_CALL.equals(action)) {
         declineIncomingCall();
         return;
@@ -304,6 +359,23 @@ public class TGCallService extends Service implements
       }
 
       if (Intents.ACTION_ANSWER_CALL.equals(action)) {
+        if (Passcode.instance().isLockedForIncomingCalls()) {
+          // E.g. "Answer" of a notification from before the lock on a watch: it asks to unlock
+          if (incomingNotification != null && !incomingNotificationLocked) {
+            showIncomingNotification(true);
+          }
+          return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+          if (incomingNotification != null) {
+            U.startForeground(TGCallService.this,
+              TdlibNotificationManager.ID_FOREGROUND_INCOMING_CALL_NOTIFICATION,
+              incomingNotification, true);
+          } else if (isForegroundPlaceholderShown) {
+            U.startForeground(TGCallService.this, TdlibNotificationManager.ID_FOREGROUND_CALL_START,
+              foregroundPlaceholder, true);
+          }
+        }
         acceptIncomingCall();
         return;
       }
@@ -356,6 +428,15 @@ public class TGCallService extends Service implements
     soundPoolMap.prepare(R.raw.voip_connecting, R.raw.voip_ringback, R.raw.voip_fail, R.raw.voip_end, R.raw.voip_busy);
 
     VoIP.initialize(this);
+    Passcode.instance().addLockListener(this);
+  }
+
+  @Override
+  public void onPasscodeLocked (boolean isLocked) {
+    boolean isLockedForCalls = Passcode.instance().isLockedForIncomingCalls();
+    if (incomingNotification != null && incomingNotificationLocked != isLockedForCalls) {
+      showIncomingNotification(true);
+    }
   }
 
   private Object communicationDeviceChangedListener;
@@ -391,6 +472,9 @@ public class TGCallService extends Service implements
         filter.addAction(AudioManager.ACTION_SCO_AUDIO_STATE_UPDATED);
       }
       filter.addAction(TelephonyManager.ACTION_PHONE_STATE_CHANGED);
+      filter.addAction(Intent.ACTION_SCREEN_OFF);
+      filter.addAction(Intent.ACTION_SCREEN_ON);
+      filter.addAction(Intent.ACTION_USER_PRESENT);
       /*filter.addAction(Intents.ACTION_END_CALL);
       filter.addAction(Intents.ACTION_DECLINE_CALL);
       filter.addAction(Intents.ACTION_ANSWER_CALL);*/
@@ -473,21 +557,19 @@ public class TGCallService extends Service implements
   }
 
   private void setCall (TdApi.Call call) {
-    boolean sameCall = this.call != null && call != null && this.call.id == call.id;
-    if (!sameCall) {
-      incomingAnswerRequested = false;
-    }
     this.call = call;
-    this.callChannelId = sameCall && this.callChannelId != null ? this.callChannelId : this.call != null ? "call_" + this.call.id + "_" + System.currentTimeMillis() : null;
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      cleanupChannels((NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE));
-    }
   }
 
   @Override
   public void onDestroy () {
     this.isDestroyed = true;
     Log.v(Log.TAG_VOIP, "TGCallService.onDestroy");
+    Passcode.instance().removeLockListener(this);
+    UI.cancel(microphoneCheck);
+    if (call != null) {
+      tdlib.cache().unsubscribeFromCallUpdates(call.id, this);
+    }
+    UI.removeStateListener(this);
 
     setCall(null);
     updateCurrentState();
@@ -510,29 +592,6 @@ public class TGCallService extends Service implements
     }
 
     setCallId(null, 0);
-  }
-
-  @Override
-  public void onTimeout (int startId) {
-    handleShortServiceTimeout(startId);
-  }
-
-  @Override
-  public void onTimeout (int startId, int foregroundServiceType) {
-    if (foregroundServiceType == ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE) {
-      handleShortServiceTimeout(startId);
-    }
-  }
-
-  private void handleShortServiceTimeout (int startId) {
-    if (foregroundState != CallForegroundStateMachine.State.RINGING) {
-      return;
-    }
-    logForegroundTransition("SHORT_SERVICE_TIMEOUT", "NONE", foregroundState,
-      CallForegroundStateMachine.State.NONE);
-    declineIncomingCall();
-    setIsRinging(false);
-    stopSelf(startId);
   }
 
   // Call state updates
@@ -559,15 +618,16 @@ public class TGCallService extends Service implements
         sentDebugLog = true;
         tdlib.send(new TdApi.SendCallDebugInformation(new TdApi.InputCallDiscarded(call.id), lastDebugLog.toString()), tdlib.typedOkHandler());
       }
-      if (!sentRating && (((TdApi.CallStateDiscarded) call.state).needRating || BuildConfig.EXPERIMENTAL)) {
+      boolean needRating = ((TdApi.CallStateDiscarded) call.state).needRating;
+      if (!sentRating && TD.canRateCall(call) && needRating) {
         sentRating = true;
         // TODO new feedback pop-up
         startRatingActivity();
       }
     }
+    configureDeviceForCall();
     updateCurrentSound();
     showNotification();
-    configureDeviceForCall();
     updateStats();
     checkInitiated();
   }
@@ -575,7 +635,8 @@ public class TGCallService extends Service implements
   private void startRatingActivity () {
     if (tdlib != null && call != null) {
       try {
-        PendingIntent.getActivity(TGCallService.this, 0, new Intent(TGCallService.this, VoIPFeedbackActivity.class)
+        PendingIntent.getActivity(TGCallService.this, Intents.REQUEST_CODE_CALL_RATING,
+          new Intent(TGCallService.this, VoIPFeedbackActivity.class)
           .setAction("RATE_CALL_" + call.id)
           .putExtra("account_id", tdlib.id())
           .putExtra("call_id", call.id)
@@ -587,7 +648,13 @@ public class TGCallService extends Service implements
   }
 
   @Override
-  public void onCallStateChanged (int callId, int newState) { }
+  public void onCallStateChanged (int callId, int newState) {
+    if (newState == CallState.ESTABLISHED && call != null && call.id == callId &&
+      ongoingCallNotification != null) {
+      ongoingCallNotification = null;
+      showNotification();
+    }
+  }
 
   private int callBarsCount = -1;
 
@@ -744,22 +811,12 @@ public class TGCallService extends Service implements
     }
   }
 
-  public boolean prepareForIncomingCallAnswer () {
-    if (call == null || call.isOutgoing ||
-        call.state.getConstructor() != TdApi.CallStatePending.CONSTRUCTOR) {
-      logForegroundTransition("ANSWER_REJECTED_INVALID_STATE", "NONE", foregroundState, foregroundState);
-      return false;
-    }
-    boolean promoted = ensureActiveCallForeground("ANSWER", true);
-    if (promoted) {
-      incomingAnswerRequested = true;
-    }
-    return promoted;
-  }
-
   private void declineIncomingCall () {
-    if (call != null) {
+    if (call != null && !call.isOutgoing &&
+      call.state.getConstructor() == TdApi.CallStatePending.CONSTRUCTOR) {
       tdlib.context().calls().hangUp(tdlib, call.id, false, 0);
+    } else {
+      cancelIncomingNotification();
     }
   }
 
@@ -776,17 +833,65 @@ public class TGCallService extends Service implements
   @Override
   public void onUiStateChanged (int newState) {
     updateCurrentState();
-    boolean isPendingIncoming = call != null && !call.isOutgoing && call.state.getConstructor() == TdApi.CallStatePending.CONSTRUCTOR;
-    if (isPendingIncoming) {
-      if (newState != UI.State.RESUMED && needShowIncomingNotification) {
-        needShowIncomingNotification = false;
-        showIncomingNotification();
-      } else if (newState == UI.State.RESUMED) {
-        needShowIncomingNotification = true;
-        cleanupChannels((NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE));
-        stopRingingForeground("UI_RESUMED");
+    if (ongoingCallNotification != null) {
+      if (newState == UI.State.RESUMED) {
+        // Visible now, so the microphone for the rest of the call: Android 11–13 check it again
+        // at a start of the service, Android 12+ also at startForeground
+        Intent intent = new Intent(this, TGCallService.class);
+        intent.putExtra(Intents.KEY_ACCOUNT_ID, tdlib.id());
+        intent.putExtra(Intents.KEY_CALL_ID, call.id);
+        startService(intent);
+        U.startForeground(this, TdlibNotificationManager.ID_FOREGROUND_ONGOING_CALL_NOTIFICATION,
+          ongoingCallNotification, true);
       }
+      scheduleMicrophoneCheck(1000);
     }
+    updateIncomingNotification();
+  }
+
+  public static void checkIncomingNotification () {
+    TGCallService service = currentInstance();
+    if (service != null) {
+      service.updateIncomingNotification();
+    }
+  }
+
+  private void updateIncomingNotification () {
+    boolean isPendingIncoming = call != null && !call.isOutgoing &&
+      call.state.getConstructor() == TdApi.CallStatePending.CONSTRUCTOR;
+    if (!isPendingIncoming || isNotificationRinging || incomingNotification == null) {
+      return;
+    }
+    boolean isCallScreenShown = isCallScreenShown();
+    if (isCallScreenShown == isIncomingNotificationQuiet) {
+      return;
+    }
+    isIncomingNotificationQuiet = isCallScreenShown;
+    if (isCallScreenShown) {
+      showIncomingNotification(true);
+    } else {
+      // Added again, as an update doesn't open its full-screen intent
+      U.stopForeground(this, true,
+        TdlibNotificationManager.ID_FOREGROUND_INCOMING_CALL_NOTIFICATION);
+      incomingNotification = null;
+      showIncomingNotification();
+    }
+  }
+
+  private boolean isCallScreenShown () {
+    BaseActivity activity = UI.getUiContext();
+    if (call == null || activity == null || (activity.getActivityState() != UI.State.RESUMED &&
+      !activity.isRequestingMicForCall())) {
+      return false;
+    }
+    if (activity.isPasscodeShowing()) {
+      CallManager calls = tdlib.context().calls();
+      return Passcode.instance().requireForIncomingCalls() &&
+        calls.getCurrentCallAccountId() == tdlib.id() && calls.getCurrentCallId() == call.id;
+    }
+    ViewController<?> c = activity.navigation().getCurrentStackItem();
+    return c instanceof CallController && !c.isDestroyed() && c.tdlibId() == callTdlib() &&
+      ((CallController) c).compareUserId(call.userId);
   }
 
   // Configuration
@@ -800,10 +905,7 @@ public class TGCallService extends Service implements
   private void configureDeviceForCall () {
     AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
 
-    boolean shouldConfigure = TD.isActive(call) &&
-      foregroundState == CallForegroundStateMachine.State.ACTIVE_MICROPHONE;
-
-    if (shouldConfigure && !isConfigured) {
+    if (TD.isActive(call) && !isConfigured) {
       isConfigured = true;
 
       Log.i(Log.TAG_VOIP, "Configuring device for call...");
@@ -828,7 +930,7 @@ public class TGCallService extends Service implements
       } catch (Throwable t) {
         Log.e(Log.TAG_VOIP, "Error initializing proximity sensor", t);
       }
-    } else if (!shouldConfigure && isConfigured) {
+    } else if (!TD.isActive(call) && isConfigured) {
       isConfigured = false;
 
       Log.i(Log.TAG_VOIP, "Unconfiguring device from call...");
@@ -892,263 +994,162 @@ public class TGCallService extends Service implements
   private static final @DrawableRes int CALL_ICON_RES = R.drawable.baseline_phone_24_white;
 
   private void showNotification () {
-    boolean needNotification = call != null &&
-      (call.isOutgoing || incomingAnswerRequested ||
-        call.state.getConstructor() == TdApi.CallStateExchangingKeys.CONSTRUCTOR ||
-        call.state.getConstructor() == TdApi.CallStateReady.CONSTRUCTOR) &&
-      !TD.isFinished(call);
+    boolean needNotification = call != null && (call.isOutgoing || call.state.getConstructor() == TdApi.CallStateExchangingKeys.CONSTRUCTOR || call.state.getConstructor() == TdApi.CallStateReady.CONSTRUCTOR) && !TD.isFinished(call);
+
+    if (needNotification == (ongoingCallNotification != null)) {
+      return;
+    }
 
     if (!needNotification) {
-      if (foregroundState == CallForegroundStateMachine.State.ACTIVE_MICROPHONE) {
-        stopCallForeground("CALL_NOT_ACTIVE");
-      }
-      ongoingCallNotification = null;
+      stopForegroundOfCall();
+      incomingNotification = ongoingCallNotification = null;
       return;
     }
 
-    if (ongoingCallNotification != null) {
-      return;
-    }
 
-    if (call.isOutgoing) {
-      ensureActiveCallForeground("OUTGOING", false);
-    } else if (foregroundState != CallForegroundStateMachine.State.ACTIVE_MICROPHONE) {
-      logForegroundTransition("ACTIVE_NOTIFICATION_BLOCKED", "NONE", foregroundState, foregroundState);
-    } else {
-      ensureActiveCallForeground("ACTIVE_NOTIFICATION", false);
-    }
-  }
 
-  private Notification buildOngoingCallNotification () {
     Notification.Builder builder;
 
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      NotificationManager m = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-      cleanupChannels(m);
-      // final String channelId = "call_" + call.id + "_" + System.currentTimeMillis();
-      android.app.NotificationChannel channel = new android.app.NotificationChannel(callChannelId, Lang.getString(R.string.NotificationChannelOutgoingCall), NotificationManager.IMPORTANCE_LOW);
-      channel.enableVibration(false);
-      channel.enableLights(false);
-      channel.setSound(null, null);
-      try {
-        m.createNotificationChannel(channel);
-      } catch (Throwable t) {
-        Log.v("Unable to create notification channel for call", new TdlibNotificationChannelGroup.ChannelCreationFailureException(t));
-      }
-      builder = new Notification.Builder(this, callChannelId);
+      builder = new Notification.Builder(this, U.getOngoingCallsNotificationChannel());
     } else {
       builder = new Notification.Builder(this);
     }
 
+    int titleRes = call.isOutgoing ? R.string.CallOngoingOutgoing : R.string.CallOngoingIncoming;
+    boolean isCallStyle = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S;
+    String microphoneOff = isMicrophoneOff ? Lang.getString(R.string.VoipMicrophoneOff) : null;
+    if (isCallStyle) {
+      builder
+        .setContentTitle(TD.getUserName(user))
+        .setContentText(microphoneOff != null ? microphoneOff : Lang.getString(titleRes));
+    } else {
+      builder
+        .setContentTitle(Lang.getString(titleRes))
+        .setContentText(microphoneOff != null ? microphoneOff : TD.getUserName(user));
+    }
     builder
-      .setContentTitle(Lang.getString(R.string.OutgoingCall))
-      .setContentText(TD.getUserName(user))
       .setSmallIcon(CALL_ICON_RES)
-      .setContentIntent(PendingIntent.getActivity(UI.getContext(), 0, Intents.valueOfCall(), PendingIntent.FLAG_ONE_SHOT | Intents.mutabilityFlags(false)));
+      .setContentIntent(newCallScreenIntent());
     if (tdlib.context().isMultiUser()) {
       String shortName = tdlib.accountShortName();
       if (shortName != null) {
         builder.setSubText(shortName);
       }
     }
+    PendingIntent endCall = null;
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
       Intent endIntent = new Intent();
       Intents.secureIntent(endIntent, false);
       endIntent.setAction(Intents.ACTION_END_CALL);
-      builder.addAction(R.drawable.round_call_end_24_white, Lang.getString(R.string.VoipEndCall), PendingIntent.getBroadcast(this, 0, endIntent, Intents.mutabilityFlags(false)));
+      endCall = PendingIntent.getBroadcast(this, Intents.REQUEST_CODE_CALL_END, endIntent,
+        Intents.mutabilityFlags(false));
+      if (!isCallStyle) {
+        builder.addAction(R.drawable.round_call_end_24_white, Lang.getString(R.string.VoipEndCall),
+          endCall);
+      }
       builder.setPriority(Notification.PRIORITY_MAX);
     }
+    long duration = getCallDuration();
+    boolean isConnected = duration != VoIPInstance.DURATION_UNKNOWN;
+    if (isConnected) {
+      builder.setWhen(System.currentTimeMillis() - duration);
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
+        builder.setUsesChronometer(true);
+      }
+    }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
-      builder.setShowWhen(false);
+      builder.setShowWhen(isConnected);
     }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
       builder.setColor(tdlib.accountColor());
     }
-    Bitmap bitmap = TdlibNotificationUtils.buildLargeIcon(tdlib, user.profilePhoto != null ? user.profilePhoto.small : null, tdlib.cache().userAccentColor(user), TD.getLetters(user), false, true);
+    Bitmap bitmap = TdlibNotificationUtils.buildLargeIcon(tdlib, ChatId.fromUserId(user.id),
+      user.profilePhoto != null ? user.profilePhoto.small : null,
+      tdlib.cache().userAccentColor(user), TD.getLetters(user), false, true);
     if (bitmap != null) {
       builder.setLargeIcon(bitmap);
     }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      android.app.Person caller = TdlibNotificationUtils.newCallPerson(tdlib, user, false, bitmap);
+      builder.setStyle(Notification.CallStyle.forOngoingCall(caller, endCall)
+        .setIsVideo(call.isVideo));
+    }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
-      return builder.build();
+      ongoingCallNotification = builder.build();
     } else {
-      return builder.getNotification();
+      ongoingCallNotification = builder.getNotification();
     }
+    U.startForeground(this, TdlibNotificationManager.ID_FOREGROUND_ONGOING_CALL_NOTIFICATION, ongoingCallNotification, true);
+    cancelForegroundPlaceholder();
+    cancelIncomingNotification();
+    // The capabilities of the process follow the service a moment later
+    scheduleMicrophoneCheck(1000);
   }
 
-  private boolean hasRecordAudioPermission () {
-    return Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
-      checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+  private boolean isMicrophoneOff;
+  private final Runnable microphoneCheck = this::checkMicrophone;
+
+  private void scheduleMicrophoneCheck (long delayMs) {
+    UI.cancel(microphoneCheck);
+    UI.post(microphoneCheck, delayMs);
   }
 
-  private void startForegroundWithType (int notificationId, Notification notification, int foregroundServiceType) {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-      startForeground(notificationId, notification, foregroundServiceType);
-    } else {
-      startForeground(notificationId, notification);
-    }
-  }
-
-  private void logForegroundTransition (
-    String event,
-    String requested,
-    @CallForegroundStateMachine.State int previousState,
-    @CallForegroundStateMachine.State int newState
-  ) {
-    if (!BuildConfig.DEBUG) {
+  private void checkMicrophone () {
+    // Android 11+ denies the microphone to a call answered in background, as does its toggle of
+    // Android 12+ at any time; access lasts 5 s after the app leaves the screen, so every 5 s
+    if (ongoingCallNotification == null) {
       return;
     }
-    String callState = call != null && call.state != null ?
-      call.state.getClass().getSimpleName() : "NONE";
-    Log.i(Log.TAG_VOIP,
-      "TGX-Call-FGS: event=%s incoming=%b callState=%s ringing=%b appForeground=%b " +
-        "recordAudioGranted=%b requested=%s previous=%s new=%s sdk=%d",
-      event,
-      call != null && !call.isOutgoing,
-      callState,
-      isRinging,
-      UI.getUiState() == UI.State.RESUMED,
-      hasRecordAudioPermission(),
-      requested,
-      CallForegroundStateMachine.toString(previousState),
-      CallForegroundStateMachine.toString(newState),
-      Build.VERSION.SDK_INT
-    );
-  }
-
-  private boolean ensureRingingForeground (Notification notification) {
-    final int desiredState = CallForegroundStateMachine.decide(
-      foregroundState,
-      call != null && !call.isOutgoing,
-      isRinging,
-      false,
-      false,
-      hasRecordAudioPermission(),
-      TD.isFinished(call)
-    );
-    if (desiredState == CallForegroundStateMachine.State.ACTIVE_MICROPHONE) {
-      logForegroundTransition("RINGING_NO_DOWNGRADE", "NONE", foregroundState, foregroundState);
-      return false;
+    boolean isOff = false;
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+      android.app.AppOpsManager appOps =
+        (android.app.AppOpsManager) getSystemService(Context.APP_OPS_SERVICE);
+      isOff = appOps != null && appOps.unsafeCheckOpNoThrow(
+        android.app.AppOpsManager.OPSTR_RECORD_AUDIO, Process.myUid(), getPackageName()
+      ) == android.app.AppOpsManager.MODE_IGNORED;
     }
-    if (desiredState != CallForegroundStateMachine.State.RINGING) {
-      logForegroundTransition("RINGING_BLOCKED", "NONE", foregroundState, foregroundState);
-      return false;
-    }
-    if (foregroundState == CallForegroundStateMachine.State.RINGING) {
-      return true;
-    }
-
-    final int requestedType;
-    final String requestedTypeName;
-    int requestedTypeDecision = CallForegroundStateMachine.requestedTypeForState(
-      desiredState, Build.VERSION.SDK_INT);
-    if (requestedTypeDecision == CallForegroundStateMachine.RequestedType.SHORT_SERVICE) {
-      requestedType = ServiceInfo.FOREGROUND_SERVICE_TYPE_SHORT_SERVICE;
-      requestedTypeName = "SHORT_SERVICE";
+    if (isOff != isMicrophoneOff) {
+      isMicrophoneOff = isOff;
+      ongoingCallNotification = null;
+      showNotification();
     } else {
-      requestedType = ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE;
-      requestedTypeName = "NONE";
-    }
-
-    final int previousState = foregroundState;
-    try {
-      startForegroundWithType(
-        TdlibNotificationManager.ID_FOREGROUND_INCOMING_CALL_NOTIFICATION,
-        notification,
-        requestedType
-      );
-      foregroundState = CallForegroundStateMachine.State.RINGING;
-      logForegroundTransition("INCOMING_RINGING", requestedTypeName, previousState, foregroundState);
-      return true;
-    } catch (RuntimeException e) {
-      Log.e(Log.TAG_VOIP, "TGX-Call-FGS: unable to start ringing foreground service", e);
-      logForegroundTransition("RINGING_PROMOTION_FAILED", requestedTypeName, previousState, foregroundState);
-      stopRinging();
-      stopSelf();
-      return false;
+      scheduleMicrophoneCheck(5000);
     }
   }
 
-  private boolean ensureActiveCallForeground (String event, boolean answerRequested) {
-    final boolean recordAudioGranted = hasRecordAudioPermission();
-    final boolean outgoingFromVisibleUi = call != null && call.isOutgoing &&
-      UI.getUiState() == UI.State.RESUMED;
-    final int desiredState = CallForegroundStateMachine.decide(
-      foregroundState,
-      call != null && !call.isOutgoing,
-      isRinging,
-      answerRequested,
-      outgoingFromVisibleUi,
-      recordAudioGranted,
-      TD.isFinished(call)
-    );
-    if (desiredState != CallForegroundStateMachine.State.ACTIVE_MICROPHONE) {
-      logForegroundTransition(event + "_BLOCKED", "MICROPHONE", foregroundState, foregroundState);
-      return false;
+  private void cancelForegroundPlaceholder () {
+    if (isForegroundPlaceholderShown) {
+      NotificationManager manager =
+        (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+      manager.cancel(TdlibNotificationManager.ID_FOREGROUND_CALL_START);
+      isForegroundPlaceholderShown = false;
     }
-    if (foregroundState == CallForegroundStateMachine.State.ACTIVE_MICROPHONE &&
-        ongoingCallNotification != null) {
-      return true;
-    }
+  }
 
-    Notification notification = buildOngoingCallNotification();
-    final int previousState = foregroundState;
-    int requestedTypeDecision = CallForegroundStateMachine.requestedTypeForState(
-      desiredState, Build.VERSION.SDK_INT);
-    final int requestedType = requestedTypeDecision == CallForegroundStateMachine.RequestedType.MICROPHONE ?
-      ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE : ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE;
-    final String requestedTypeName = requestedTypeDecision == CallForegroundStateMachine.RequestedType.MICROPHONE ?
-      "MICROPHONE" : "NONE";
-    try {
-      startForegroundWithType(
+  private void cancelIncomingNotification () {
+    if (canCancelIncomingNotification()) {
+      NotificationManager manager =
+        (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+      manager.cancel(TdlibNotificationManager.ID_FOREGROUND_INCOMING_CALL_NOTIFICATION);
+    }
+  }
+
+  private boolean canCancelIncomingNotification () {
+    // Under the same id CallManager may show another call, which rings without its service
+    return call != null &&
+      !tdlib.context().calls().isAnotherCallShownWithoutService(tdlib, call.id);
+  }
+
+  private void stopForegroundOfCall () {
+    if (canCancelIncomingNotification()) {
+      U.stopForeground(this, true,
         TdlibNotificationManager.ID_FOREGROUND_ONGOING_CALL_NOTIFICATION,
-        notification,
-        requestedType
-      );
-      foregroundState = CallForegroundStateMachine.State.ACTIVE_MICROPHONE;
-      ongoingCallNotification = notification;
-      NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-      if (manager != null) {
-        manager.cancel(TdlibNotificationManager.ID_FOREGROUND_INCOMING_CALL_NOTIFICATION);
-      }
-      incomingNotification = null;
-      logForegroundTransition(event, requestedTypeName, previousState, foregroundState);
-      return true;
-    } catch (RuntimeException e) {
-      Log.e(Log.TAG_VOIP, "TGX-Call-FGS: unable to promote call to microphone foreground service", e);
-      logForegroundTransition(event + "_PROMOTION_FAILED", requestedTypeName, previousState, foregroundState);
-      if (call != null && call.isOutgoing) {
-        hangUp();
-        stopCallForeground("OUTGOING_PROMOTION_FAILED");
-        stopSelf();
-      }
-      return false;
+        TdlibNotificationManager.ID_FOREGROUND_INCOMING_CALL_NOTIFICATION);
+    } else {
+      U.stopForeground(this, true,
+        TdlibNotificationManager.ID_FOREGROUND_ONGOING_CALL_NOTIFICATION);
     }
-  }
-
-  private void stopRingingForeground (String event) {
-    if (foregroundState == CallForegroundStateMachine.State.RINGING) {
-      final int previousState = foregroundState;
-      U.stopForeground(this, true, TdlibNotificationManager.ID_FOREGROUND_INCOMING_CALL_NOTIFICATION);
-      foregroundState = CallForegroundStateMachine.State.NONE;
-      incomingNotification = null;
-      logForegroundTransition(event, "NONE", previousState, foregroundState);
-    } else if (incomingNotification != null) {
-      NotificationManager manager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-      if (manager != null) {
-        manager.cancel(TdlibNotificationManager.ID_FOREGROUND_INCOMING_CALL_NOTIFICATION);
-      }
-      incomingNotification = null;
-    }
-  }
-
-  private void stopCallForeground (String event) {
-    final int previousState = foregroundState;
-    U.stopForeground(this, true,
-      TdlibNotificationManager.ID_FOREGROUND_ONGOING_CALL_NOTIFICATION,
-      TdlibNotificationManager.ID_FOREGROUND_INCOMING_CALL_NOTIFICATION);
-    foregroundState = CallForegroundStateMachine.State.NONE;
-    incomingNotification = ongoingCallNotification = null;
-    logForegroundTransition(event, "NONE", previousState, foregroundState);
   }
 
   // Sound
@@ -1168,27 +1169,38 @@ public class TGCallService extends Service implements
 
   private MediaPlayer ringtonePlayer;
   private Vibrator vibrator;
+  private @Nullable String ringChannelId;
+  private boolean isAppRinging, isNotificationRinging, isShownByCallManager;
   private Notification incomingNotification;
+  private boolean isIncomingNotificationQuiet;
+  private boolean incomingNotificationLocked, incomingNotificationPhoneLocked;
 
-  private boolean needShowIncomingNotification;
+  private boolean isPhoneLocked () {
+    KeyguardManager keyguard = (KeyguardManager) getSystemService(Context.KEYGUARD_SERVICE);
+    return keyguard != null && keyguard.isKeyguardLocked();
+  }
 
   private boolean showIncomingNotification () {
+    return showIncomingNotification(false);
+  }
+
+  private boolean showIncomingNotification (boolean replace) {
     boolean needNotification = call != null && !call.isOutgoing && call.state.getConstructor() == TdApi.CallStatePending.CONSTRUCTOR;
 
     if (!needNotification && incomingNotification == null) {
       return false;
     }
+    if (isShownByCallManager) {
+      // An update of the notification of CallManager would stop its ringtone, and One UI would
+      // show it as a heads-up over the screen of the call
+      return true;
+    }
 
     needNotification = needNotification && NotificationManagerCompat.from(this).areNotificationsEnabled();
 
-    if (needNotification == (incomingNotification != null)) {
+    boolean isReplacing = replace && needNotification && incomingNotification != null;
+    if (!isReplacing && needNotification == (incomingNotification != null)) {
       return needNotification;
-    }
-
-    if (UI.getUiState() == UI.State.RESUMED) {
-      needShowIncomingNotification = true;
-      Log.i("No need to show incoming notification right now, but may in future.");
-      return true;
     }
 
     /*if (!needNotification) {
@@ -1201,63 +1213,98 @@ public class TGCallService extends Service implements
 
     Notification.Builder builder;
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      NotificationManager m = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
-      cleanupChannels(m);
-      // final String channelId = "call_" + call.id + "_" + System.currentTimeMillis();
-      android.app.NotificationChannel channel = new android.app.NotificationChannel(callChannelId, Lang.getString(R.string.NotificationChannelCall), NotificationManager.IMPORTANCE_HIGH);
-      channel.enableVibration(false);
-      channel.enableLights(false);
-      channel.setSound(null, null);
-      try {
-        m.createNotificationChannel(channel);
-      } catch (Throwable t) {
-        Log.v("Unable to create notification channel for call", new TdlibNotificationChannelGroup.ChannelCreationFailureException(t));
+      String channelId;
+      if (isIncomingNotificationQuiet) {
+        channelId = U.getOngoingCallsNotificationChannel();
+      } else if (isNotificationRinging) {
+        channelId = ringChannelId;
+      } else {
+        channelId = U.getIncomingCallsInAppNotificationChannel();
       }
-      builder = new Notification.Builder(this, callChannelId);
+      builder = new Notification.Builder(this, channelId);
+      // An update that only alerts once stops the system's insistent ringtone, e.g. on screen off
+      builder.setOnlyAlertOnce(!isNotificationRinging);
     } else {
       builder = new Notification.Builder(this);
     }
 
+    // A locked phone asks for its PIN before an action that opens an activity, so there only a
+    // tap on the notification opens the call, over the lock screen
+    boolean isLocked = Passcode.instance().isLockedForIncomingCalls();
+    boolean isPhoneLocked = isLocked && isPhoneLocked();
+    incomingNotificationLocked = isLocked;
+    incomingNotificationPhoneLocked = isPhoneLocked;
+    boolean isCallStyle = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S;
+    String lockedText = isPhoneLocked ? Lang.getString(R.string.CallTapToSeeCaller) :
+      isLocked ? Lang.getString(R.string.CallUnlockToAnswer) : null;
+    if (isCallStyle) {
+      builder.setContentText(
+        lockedText != null ? lockedText : Lang.getString(R.string.CallBrandingIncoming)
+      );
+    } else {
+      builder
+        .setContentTitle(Lang.getString(
+          isLocked ? R.string.IncomingCall : R.string.CallBrandingIncoming
+        ))
+        .setContentText(lockedText != null ? lockedText : TD.getUserName(user));
+    }
     builder
-      .setContentTitle(Lang.getString(R.string.CallBrandingIncoming))
-      .setContentText(TD.getUserName(user))
       .setSmallIcon(CALL_ICON_RES)
-      .setContentIntent(PendingIntent.getActivity(UI.getContext(), 0, Intents.valueOfCall(), PendingIntent.FLAG_ONE_SHOT | Intents.mutabilityFlags(false)));
+      .setContentIntent(newCallScreenIntent());
     if (tdlib.context().isMultiUser()) {
       String shortName = tdlib.accountShortName();
       if (shortName != null) {
         builder.setSubText(shortName);
       }
     }
+    PendingIntent declineAction = null, answerAction = null;
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
       Intent endIntent = new Intent();
       Intents.secureIntent(endIntent, false);
       endIntent.setAction(Intents.ACTION_DECLINE_CALL);
+      if (tdlib != null && call != null) {
+        endIntent.putExtra(Intents.KEY_ACCOUNT_ID, tdlib.id());
+        endIntent.putExtra(Intents.KEY_CALL_ID, call.id);
+      }
       CharSequence endTitle = Lang.getString(R.string.DeclineCall);
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
         endTitle = new SpannableString(endTitle);
         ((SpannableString) endTitle).setSpan(new ForegroundColorSpan(Theme.getColor(ColorId.circleButtonNegative)), 0, endTitle.length(), 0);
       }
-      builder.addAction(R.drawable.round_call_end_24_white, endTitle, PendingIntent.getBroadcast(this, 0, endIntent, PendingIntent.FLAG_ONE_SHOT | Intents.mutabilityFlags(false)));
+      declineAction = PendingIntent.getBroadcast(this, Intents.REQUEST_CODE_CALL_DECLINE, endIntent,
+        PendingIntent.FLAG_ONE_SHOT | Intents.mutabilityFlags(false));
+      if (!isCallStyle) {
+        builder.addAction(R.drawable.round_call_end_24_white, endTitle, declineAction);
+      }
       Intent answerIntent = new Intent();
       Intents.secureIntent(answerIntent, false);
       answerIntent.setAction(Intents.ACTION_ANSWER_CALL);
-      CharSequence answerTitle = Lang.getString(R.string.AnswerCall);
+      CharSequence answerTitle =
+        Lang.getString(isLocked ? R.string.CallUnlock : R.string.AnswerCall);
       if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
         answerTitle = new SpannableString(answerTitle);
         ((SpannableString) answerTitle).setSpan(new ForegroundColorSpan(Theme.getColor(ColorId.circleButtonPositive)), 0, answerTitle.length(), 0);
       }
-      PendingIntent answerPendingIntent;
-      if (hasRecordAudioPermission()) {
-        answerPendingIntent = PendingIntent.getBroadcast(this, 0, answerIntent,
-          PendingIntent.FLAG_ONE_SHOT | Intents.mutabilityFlags(false));
+      boolean hasMicrophone = ContextCompat.checkSelfPermission(this,
+        Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED;
+      if (isLocked) {
+        answerAction = newCallScreenIntent();
+      } else if (!hasMicrophone) {
+        // Only an activity asks for the microphone. Not one-shot: the notification isn't posted
+        // again while it rings
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT | Intents.mutabilityFlags(false);
+        answerAction = PendingIntent.getActivity(UI.getContext(), Intents.REQUEST_CODE_CALL_ANSWER,
+          Intents.valueOfAnswerCall(tdlib.id(), call.id), flags);
       } else {
-        answerPendingIntent = PendingIntent.getActivity(this, 1, Intents.valueOfCall(),
-          PendingIntent.FLAG_ONE_SHOT | Intents.mutabilityFlags(false));
-        logForegroundTransition("ANSWER_REQUIRES_PERMISSION_UI", "NONE", foregroundState, foregroundState);
+        answerAction = PendingIntent.getBroadcast(this, Intents.REQUEST_CODE_CALL_ANSWER,
+          answerIntent, PendingIntent.FLAG_ONE_SHOT | Intents.mutabilityFlags(false));
       }
-      builder.addAction(R.drawable.round_call_24_white, answerTitle, answerPendingIntent);
-      builder.setPriority(Notification.PRIORITY_MAX);
+      if (!isCallStyle && !isPhoneLocked) {
+        builder.addAction(R.drawable.round_call_24_white, answerTitle, answerAction);
+      }
+      builder.setPriority(
+        isIncomingNotificationQuiet ? Notification.PRIORITY_LOW : Notification.PRIORITY_MAX
+      );
     }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
       builder.setShowWhen(false);
@@ -1266,34 +1313,205 @@ public class TGCallService extends Service implements
       builder.setColor(tdlib.accountColor());
       builder.setVibrate(new long[0]);
       builder.setCategory(Notification.CATEGORY_CALL);
-      builder.setFullScreenIntent(PendingIntent.getActivity(this, PendingIntent.FLAG_ONE_SHOT, Intents.valueOfCall(), Intents.mutabilityFlags(false)), true);
+      if (user != null) {
+        TdlibNotificationUtils.addCallPerson(builder, tdlib, user, isLocked);
+      }
+      if (!isIncomingNotificationQuiet) {
+        Intent screen = Intents.valueOfCall(tdlib.id(), call.id);
+        int flags = PendingIntent.FLAG_UPDATE_CURRENT | Intents.mutabilityFlags(false);
+        builder.setFullScreenIntent(PendingIntent.getActivity(this,
+          Intents.REQUEST_CODE_CALL_FULL_SCREEN, screen, flags), true);
+      }
     }
-    Bitmap bitmap = user != null ? TdlibNotificationUtils.buildLargeIcon(tdlib, user.profilePhoto != null ? user.profilePhoto.small : null, tdlib.cache().userAccentColor(user), TD.getLetters(user), false, true) : null;
+    Bitmap bitmap = user != null && !isLocked ?
+      TdlibNotificationUtils.buildLargeIcon(tdlib, ChatId.fromUserId(user.id),
+      user.profilePhoto != null ? user.profilePhoto.small : null,
+      tdlib.cache().userAccentColor(user), TD.getLetters(user), false, true) : null;
     if (bitmap != null) {
       builder.setLargeIcon(bitmap);
+    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      // Only this style rings at the volume of calls, others at that of notifications whatever
+      // their channel says (restrict_audio_attributes_call of AOSP)
+      android.app.Person caller =
+        TdlibNotificationUtils.newCallPerson(tdlib, user, isLocked, bitmap);
+      // Also its title, for watches that show only the title and the text
+      builder
+        .setContentTitle(caller.getName())
+        .setStyle(Notification.CallStyle.forIncomingCall(caller, declineAction, answerAction)
+          .setIsVideo(call != null && call.isVideo));
     }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN) {
       incomingNotification = builder.build();
     } else {
       incomingNotification = builder.getNotification();
     }
-    if (ensureRingingForeground(incomingNotification)) {
-      return true;
+    if (isNotificationRinging) {
+      incomingNotification.flags |= Notification.FLAG_INSISTENT;
     }
-    incomingNotification = null;
-    return false;
+    U.startForeground(this, TdlibNotificationManager.ID_FOREGROUND_INCOMING_CALL_NOTIFICATION, incomingNotification, false);
+    cancelForegroundPlaceholder();
+    return true;
   }
 
   private void startRinging () {
     Log.i(Log.TAG_VOIP, "startRinging");
     TdlibManager.instance().player().pauseWithReason(TGPlayerController.PAUSE_REASON_TELEGRAM_CALL);
+    isAppRinging = true;
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      ringChannelId = tdlib.notifications().ensureCallChannel(ChatId.fromUserId(user.id));
+      CallManager calls = tdlib.context().calls();
+      if (calls.isShownWithoutService(tdlib, call.id)) {
+        isAppRinging = false;
+        isShownByCallManager = true;
+      } else if (isDoNotDisturbOn()) {
+        // Only Android knows whether Do not disturb lets the caller through, e.g. a repeat caller
+        isAppRinging = false;
+        isNotificationRinging = canRingOnChannel();
+      } else if (isPlayerMutedInBackground() && canRingOnChannel()) {
+        // Without the channel the app rings itself: Android 17 mutes its sound, not its vibration
+        isAppRinging = false;
+        isNotificationRinging = true;
+      }
+    }
+    isIncomingNotificationQuiet = !isNotificationRinging && isCallScreenShown();
+    if (!showIncomingNotification()) {
+      Log.v(Log.TAG_VOIP, "Starting incall activity for incoming call");
+      if (UI.getUiState() != UI.State.RESUMED) {
+        bringCallToFront();
+      }
+    }
+    if (isAppRinging) {
+      startAppRinging();
+    }
+  }
+
+  private boolean isPlayerMutedInBackground () {
+    // Android 17 mutes a service started while no screen of the app is shown: on a phone in use
+    // the full-screen intent is only a heads-up, a locked or sleeping one shows the call at once
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.CINNAMON_BUN ||
+      UI.getUiState() == UI.State.RESUMED || isPhoneLocked()) {
+      return false;
+    }
+    PowerManager power = (PowerManager) getSystemService(Context.POWER_SERVICE);
+    return power == null || power.isInteractive();
+  }
+
+  @RequiresApi(Build.VERSION_CODES.O)
+  private boolean canRingOnChannel () {
+    return ringChannelId != null && tdlib.notifications().canShowOnCallChannel(ringChannelId);
+  }
+
+  @RequiresApi(Build.VERSION_CODES.O)
+  private boolean isDoNotDisturbOn () {
+    NotificationManager m = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+    int filter = m.getCurrentInterruptionFilter();
+    return filter != NotificationManager.INTERRUPTION_FILTER_ALL &&
+      filter != NotificationManager.INTERRUPTION_FILTER_UNKNOWN;
+  }
+
+  private void startAppRinging () {
+    long chatId = ChatId.fromUserId(user.id);
+    int ringerMode = tdlib.notifications().getRingerMode();
+    Uri ringtone = null;
+    long[] vibratePattern = null;
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && ringChannelId != null) {
+      NotificationManager m = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+      android.app.NotificationChannel channel = m.getNotificationChannel(ringChannelId);
+      if (channel != null && channel.getImportance() >= NotificationManager.IMPORTANCE_DEFAULT) {
+        Uri sound = channel.getSound();
+        ringtone = Uri.EMPTY.equals(sound) ? null : sound;
+        if (channel.shouldVibrate()) {
+          vibratePattern = channel.getVibrationPattern();
+          if (vibratePattern == null) {
+            // As AOSP vibrates a channel without a pattern, e.g. one of an earlier version
+            vibratePattern = TdlibNotificationManager.getDefaultVibrationPattern();
+          }
+        } else if (ringtone != null && ringerMode == AudioManager.RINGER_MODE_VIBRATE) {
+          vibratePattern = TdlibNotificationManager.getFallbackVibrationPattern();
+        }
+      }
+    } else {
+      String sound = tdlib.notifications().getCallRingtone(chatId);
+      ringtone = sound.isEmpty() ? null : Uri.parse(sound);
+      vibratePattern = tdlib.notifications().getCallVibratePattern(chatId);
+    }
+
+    // As a call of the system: no vibration in silent mode, whatever the vibration of calls says
+    if (ringerMode == AudioManager.RINGER_MODE_SILENT) {
+      vibratePattern = null;
+    }
+    if (ringtone != null && ringerMode == AudioManager.RINGER_MODE_NORMAL) {
+      Uri telegramCall = TdlibNotificationManager.getTelegramCallRingtone();
+      playRingtone(ringtone, !ringtone.equals(telegramCall), vibratePattern);
+    } else if (vibratePattern != null) {
+      startVibration(vibratePattern);
+    }
+  }
+
+  private void startVibration (long[] pattern) {
+    vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
+    if (vibrator != null) {
+      vibrateAsRingtone(vibrator, pattern);
+    }
+  }
+
+  @SuppressWarnings("deprecation")
+  private static void vibrateAsRingtone (Vibrator vibrator, long[] pattern) {
+    // As the vibration of a ringtone: one of an unknown usage takes the intensity of touches,
+    // which One UI may have off; the versions before 13 have only the deprecated forms of it
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      vibrator.vibrate(android.os.VibrationEffect.createWaveform(pattern, 0),
+        android.os.VibrationAttributes.createForUsage(
+          android.os.VibrationAttributes.USAGE_RINGTONE));
+      return;
+    }
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
+      vibrator.vibrate(pattern, 0);
+      return;
+    }
+    android.media.AudioAttributes attributes = new android.media.AudioAttributes.Builder()
+      .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+      .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+      .build();
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      vibrator.vibrate(android.os.VibrationEffect.createWaveform(pattern, 0), attributes);
+    } else {
+      vibrator.vibrate(pattern, 0, attributes);
+    }
+  }
+
+  @SuppressWarnings("deprecation")
+  private void playRingtone (Uri ringtone, boolean fallBackToDefault,
+    @Nullable long[] vibratePattern) {
+    if (vibratePattern != null) {
+      startVibration(vibratePattern);
+    }
     ringtonePlayer = new MediaPlayer();
-    ringtonePlayer.setOnPreparedListener(mediaPlayer -> ringtonePlayer.start());
+    ringtonePlayer.setOnPreparedListener(MediaPlayer::start);
     ringtonePlayer.setLooping(true);
-    ringtonePlayer.setAudioStreamType(AudioManager.STREAM_RING);
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+      // Unlike STREAM_RING, these attributes keep the player from taking over the vibration
+      ringtonePlayer.setAudioAttributes(new android.media.AudioAttributes.Builder()
+        .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION_RINGTONE)
+        .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SONIFICATION)
+        .setHapticChannelsMuted(true)
+        .build());
+    } else {
+      ringtonePlayer.setAudioStreamType(AudioManager.STREAM_RING);
+    }
+    if (fallBackToDefault) {
+      ringtonePlayer.setOnErrorListener((mediaPlayer, what, extra) -> {
+        if (ringtonePlayer == mediaPlayer) {
+          mediaPlayer.release();
+          playRingtone(TdlibNotificationManager.getTelegramCallRingtone(), false,
+            vibratePattern);
+        }
+        return true;
+      });
+    }
     try {
-      String notificationUri = tdlib.notifications().getCallRingtone(ChatId.fromUserId(user.id));
-      ringtonePlayer.setDataSource(this, Uri.parse(notificationUri));
+      ringtonePlayer.setDataSource(this, ringtone);
       ringtonePlayer.prepareAsync();
     } catch (Throwable t) {
       Log.e(Log.TAG_VOIP, "Failed to start ringing", t);
@@ -1301,34 +1519,19 @@ public class TGCallService extends Service implements
         ringtonePlayer.release();
         ringtonePlayer = null;
       }
-    }
-
-    int vibrateMode = tdlib.notifications().getCallVibrateMode(ChatId.fromUserId(user.id));
-    if (vibrateMode != TdlibNotificationManager.VIBRATE_MODE_DISABLED) {
-      vibrator = (Vibrator) getSystemService(VIBRATOR_SERVICE);
-      if (vibrator != null) {
-        switch (vibrateMode) {
-          case TdlibNotificationManager.VIBRATE_MODE_SHORT:
-            vibrator.vibrate(TdlibNotificationManager.VIBRATE_CALL_SHORT_PATTERN, 0);
-            break;
-          case TdlibNotificationManager.VIBRATE_MODE_LONG:
-            vibrator.vibrate(TdlibNotificationManager.VIBRATE_CALL_LONG_PATTERN, 0);
-            break;
-          default:
-            if (tdlib.notifications().needVibrateWhenRinging()) {
-              vibrator.vibrate(TdlibNotificationManager.VIBRATE_CALL_LONG_PATTERN, 0);
-            }
-            break;
-        }
+      if (fallBackToDefault) {
+        playRingtone(TdlibNotificationManager.getTelegramCallRingtone(), false, vibratePattern);
       }
     }
+  }
 
-    if (!showIncomingNotification()) {
-      Log.v(Log.TAG_VOIP, "Starting incall activity for incoming call");
-      if (UI.getUiState() != UI.State.RESUMED) {
-        bringCallToFront();
-      }
-    }
+  private PendingIntent newCallScreenIntent () {
+    // Extras don't make another pending intent, so an earlier call's are replaced. Not one-shot:
+    // a notification that rings isn't posted again once the screen is left
+    Intent intent = Intents.valueOfCall(tdlib.id(), call.id);
+    int flags = PendingIntent.FLAG_UPDATE_CURRENT | Intents.mutabilityFlags(false);
+    return PendingIntent.getActivity(UI.getContext(), Intents.REQUEST_CODE_CALL_SCREEN, intent,
+      flags);
   }
 
   private void bringCallToFront () {
@@ -1339,25 +1542,26 @@ public class TGCallService extends Service implements
     }*/
   }
 
-  private void cleanupChannels (NotificationManager m) {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && m != null) {
-      List<android.app.NotificationChannel> channels = m.getNotificationChannels();
-      for (android.app.NotificationChannel channel : channels) {
-        String id = channel.getId();
-        if (id.startsWith("call_") && !(callChannelId != null && callChannelId.equals(id))) {
-          try {
-            m.deleteNotificationChannel(channel.getId());
-          } catch (Throwable t) {
-            Log.e("Unable to delete notification channel", t);
-          }
-        }
-      }
+  public boolean silenceAppRinging () {
+    if (!isAppRinging) {
+      return false;
     }
+    isAppRinging = false;
+    if (ringtonePlayer != null) {
+      ringtonePlayer.release();
+      ringtonePlayer = null;
+    }
+    if (vibrator != null) {
+      vibrator.cancel();
+      vibrator = null;
+    }
+    return true;
   }
 
   private void stopRinging () {
-    cleanupChannels((NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE));
-    stopRingingForeground("RINGING_STOPPED");
+    stopForegroundOfCall();
+    incomingNotification = ongoingCallNotification = null;
+    isAppRinging = isNotificationRinging = isShownByCallManager = false;
     if (ringtonePlayer != null) {
       ringtonePlayer.stop();
       ringtonePlayer.release();
@@ -1366,6 +1570,10 @@ public class TGCallService extends Service implements
     if (vibrator != null) {
       vibrator.cancel();
       vibrator = null;
+    }
+    if (ringChannelId != null) {
+      ringChannelId = null;
+      tdlib.notifications().deleteStaleChannels();
     }
   }
 
@@ -1651,20 +1859,14 @@ public class TGCallService extends Service implements
     if (isInitiated() || TD.isFinished(call)) {
       if (TD.isFinished(call)) {
         releaseTgCalls(tdlib, call);
-        cleanupChannels((NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE));
-        stopCallForeground("CALL_FINISHED");
+        stopForegroundOfCall();
+        incomingNotification = ongoingCallNotification = null;
         stopSelf();
       }
       return;
     }
 
     if (call == null || call.state.getConstructor() != TdApi.CallStateReady.CONSTRUCTOR || !callInitialized || tdlib == null) {
-      return;
-    }
-
-    if (foregroundState != CallForegroundStateMachine.State.ACTIVE_MICROPHONE ||
-        !hasRecordAudioPermission()) {
-      logForegroundTransition("TGCALLS_START_BLOCKED", "MICROPHONE", foregroundState, foregroundState);
       return;
     }
 

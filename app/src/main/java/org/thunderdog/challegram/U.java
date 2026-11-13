@@ -42,22 +42,15 @@ import android.media.MediaScannerConnection;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
 import android.net.Uri;
-import android.opengl.EGL14;
-import android.opengl.EGLConfig;
-import android.opengl.EGLContext;
-import android.opengl.EGLDisplay;
-import android.opengl.EGLSurface;
 import android.opengl.GLES10;
 import android.opengl.GLES20;
 import android.opengl.GLUtils;
 import android.os.Build;
 import android.os.Environment;
-import android.os.LocaleList;
 import android.os.Parcelable;
 import android.os.PowerManager;
 import android.os.StatFs;
 import android.os.SystemClock;
-import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.provider.Settings;
 import android.text.BoringLayout;
@@ -80,6 +73,7 @@ import android.widget.Toast;
 import androidx.annotation.CheckResult;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+import androidx.annotation.RequiresApi;
 import androidx.core.os.EnvironmentCompat;
 import androidx.exifinterface.media.ExifInterface;
 import androidx.media3.common.C;
@@ -133,6 +127,7 @@ import org.thunderdog.challegram.telegram.Tdlib;
 import org.thunderdog.challegram.telegram.TdlibDataSource;
 import org.thunderdog.challegram.telegram.TdlibDelegate;
 import org.thunderdog.challegram.telegram.TdlibFilesManager;
+import org.thunderdog.challegram.telegram.TdlibManager;
 import org.thunderdog.challegram.telegram.TdlibNotificationChannelGroup;
 import org.thunderdog.challegram.telegram.TdlibNotificationManager;
 import org.thunderdog.challegram.tool.Fonts;
@@ -271,6 +266,12 @@ public class U {
   }
 
   public static String getRingtoneName (@NonNull Uri ringtoneUri, @Nullable String fallbackName) {
+    if (ringtoneUri.equals(TdlibNotificationManager.getTelegramCallRingtone())) {
+      return Lang.getString(R.string.RingtoneTelegramCall);
+    }
+    if (ringtoneUri.equals(android.provider.Settings.System.DEFAULT_RINGTONE_URI)) {
+      return Lang.getString(R.string.RingtoneSystemDefault);
+    }
     String[] projection = {MediaStore.MediaColumns.TITLE};
     try {
       try (Cursor cur = UI.getContext().getContentResolver().query(ringtoneUri, projection, null, null, null)) {
@@ -493,7 +494,8 @@ public class U {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
       switch (notificationId) {
         case TdlibNotificationManager.ID_FOREGROUND_ONGOING_CALL_NOTIFICATION:
-        case TdlibNotificationManager.ID_FOREGROUND_INCOMING_CALL_NOTIFICATION: {
+        case TdlibNotificationManager.ID_FOREGROUND_INCOMING_CALL_NOTIFICATION:
+        case TdlibNotificationManager.ID_FOREGROUND_CALL_START: {
           int knownType = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_PHONE_CALL;
           if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && (
             Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE ||
@@ -503,7 +505,18 @@ public class U {
             knownType |= android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
           }
           knownType |= android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK;
-          service.startForeground(notificationId, notification, knownType);
+          int microphone = android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE;
+          try {
+            service.startForeground(notificationId, notification, knownType);
+          } catch (SecurityException e) {
+            if ((knownType & microphone) == 0) {
+              throw e;
+            }
+            // Android 14+ refuses the microphone to an app that isn't visible, e.g. a call
+            // answered from a watch
+            Log.e("Unable to use the microphone in a foreground service", e);
+            service.startForeground(notificationId, notification, knownType & ~microphone);
+          }
           return;
         }
         case TdlibNotificationManager.ID_FOREGROUND_MUSIC:
@@ -923,17 +936,53 @@ public class U {
     return getNotificationChannel("maybe", R.string.NotificationChannelMaybe);
   }
 
+  public static final String CHANNEL_ID_ONGOING_CALLS = "ongoing_calls";
+
+  public static String getOngoingCallsNotificationChannel () {
+    return getNotificationChannel(
+      CHANNEL_ID_ONGOING_CALLS,
+      R.string.NotificationChannelOngoingCalls
+    );
+  }
+
+  public static final String CHANNEL_ID_INCOMING_CALLS_IN_APP = "incoming_calls_in_app";
+
+  public static String getIncomingCallsInAppNotificationChannel () {
+    String id = CHANNEL_ID_INCOMING_CALLS_IN_APP;
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      android.app.NotificationChannel channel = new android.app.NotificationChannel(
+        id,
+        Lang.getString(R.string.NotificationChannelIncomingCallScreen),
+        NotificationManager.IMPORTANCE_HIGH
+      );
+      channel.setSound(null, null);
+      channel.enableVibration(false);
+      createNotificationChannel(channel);
+    }
+    return id;
+  }
+
   public static String getNotificationChannel (String id, int stringRes) {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
       android.app.NotificationChannel channel = new android.app.NotificationChannel(id, Lang.getString(stringRes), NotificationManager.IMPORTANCE_LOW);
-      NotificationManager manager = (NotificationManager) AppContext.get().getSystemService(Context.NOTIFICATION_SERVICE);
-      try {
-        manager.createNotificationChannel(channel);
-      } catch (Throwable t) {
-        Log.v("Unable to create notification channel for id: %s", new TdlibNotificationChannelGroup.ChannelCreationFailureException(t), id);
-      }
+      createNotificationChannel(channel);
     }
     return id;
+  }
+
+  @RequiresApi(Build.VERSION_CODES.O)
+  private static void createNotificationChannel (android.app.NotificationChannel channel) {
+    NotificationManager manager =
+      (NotificationManager) AppContext.get().getSystemService(Context.NOTIFICATION_SERVICE);
+    try {
+      manager.createNotificationChannel(channel);
+    } catch (Throwable t) {
+      Log.v(
+        "Unable to create notification channel for id: %s",
+        new TdlibNotificationChannelGroup.ChannelCreationFailureException(t),
+        channel.getId()
+      );
+    }
   }
 
   private static Integer maxTextureSize;
@@ -957,49 +1006,54 @@ public class U {
       return maxTextureSize[0];
     }
 
-    EGLDisplay dpy = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
+    android.opengl.EGLDisplay dpy = android.opengl.EGL14.eglGetDisplay(
+      android.opengl.EGL14.EGL_DEFAULT_DISPLAY
+    );
     int[] vers = new int[2];
-    EGL14.eglInitialize(dpy, vers, 0, vers, 1);
+    android.opengl.EGL14.eglInitialize(dpy, vers, 0, vers, 1);
 
 
     int[] configAttr = {
-      EGL14.EGL_COLOR_BUFFER_TYPE, EGL14.EGL_RGB_BUFFER,
-      EGL14.EGL_LEVEL, 0,
-      EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
-      EGL14.EGL_SURFACE_TYPE, EGL14.EGL_PBUFFER_BIT,
-      EGL14.EGL_NONE
+      android.opengl.EGL14.EGL_COLOR_BUFFER_TYPE, android.opengl.EGL14.EGL_RGB_BUFFER,
+      android.opengl.EGL14.EGL_LEVEL, 0,
+      android.opengl.EGL14.EGL_RENDERABLE_TYPE, android.opengl.EGL14.EGL_OPENGL_ES2_BIT,
+      android.opengl.EGL14.EGL_SURFACE_TYPE, android.opengl.EGL14.EGL_PBUFFER_BIT,
+      android.opengl.EGL14.EGL_NONE
     };
-    EGLConfig[] configs = new EGLConfig[1];
+    android.opengl.EGLConfig[] configs = new android.opengl.EGLConfig[1];
     int[] numConfig = new int[1];
-    EGL14.eglChooseConfig(dpy, configAttr, 0,
+    android.opengl.EGL14.eglChooseConfig(dpy, configAttr, 0,
       configs, 0, 1, numConfig, 0);
     if (numConfig[0] == 0) {
       // TROUBLE! No config found.
       return 0;
     }
-    EGLConfig config = configs[0];
+    android.opengl.EGLConfig config = configs[0];
 
     int[] surfAttr = {
-      EGL14.EGL_WIDTH, 64,
-      EGL14.EGL_HEIGHT, 64,
-      EGL14.EGL_NONE
+      android.opengl.EGL14.EGL_WIDTH, 64,
+      android.opengl.EGL14.EGL_HEIGHT, 64,
+      android.opengl.EGL14.EGL_NONE
     };
-    EGLSurface surf = EGL14.eglCreatePbufferSurface(dpy, config, surfAttr, 0);
+    android.opengl.EGLSurface surf = android.opengl.EGL14.eglCreatePbufferSurface(dpy, config, surfAttr, 0);
 
     int[] ctxAttrib = {
-      EGL14.EGL_CONTEXT_CLIENT_VERSION, 2,
-      EGL14.EGL_NONE
+      android.opengl.EGL14.EGL_CONTEXT_CLIENT_VERSION, 2,
+      android.opengl.EGL14.EGL_NONE
     };
-    EGLContext ctx = EGL14.eglCreateContext(dpy, config, EGL14.EGL_NO_CONTEXT, ctxAttrib, 0);
+    android.opengl.EGLContext ctx = android.opengl.EGL14.eglCreateContext(dpy, config, android.opengl.EGL14.EGL_NO_CONTEXT, ctxAttrib, 0);
 
-    EGL14.eglMakeCurrent(dpy, surf, surf, ctx);
+    android.opengl.EGL14.eglMakeCurrent(dpy, surf, surf, ctx);
     GLES20.glGetIntegerv(GLES20.GL_MAX_TEXTURE_SIZE, maxTextureSize, 0);
 
-    EGL14.eglMakeCurrent(dpy, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE,
-      EGL14.EGL_NO_CONTEXT);
-    EGL14.eglDestroySurface(dpy, surf);
-    EGL14.eglDestroyContext(dpy, ctx);
-    EGL14.eglTerminate(dpy);
+    android.opengl.EGL14.eglMakeCurrent(dpy,
+      android.opengl.EGL14.EGL_NO_SURFACE,
+      android.opengl.EGL14.EGL_NO_SURFACE,
+      android.opengl.EGL14.EGL_NO_CONTEXT
+    );
+    android.opengl.EGL14.eglDestroySurface(dpy, surf);
+    android.opengl.EGL14.eglDestroyContext(dpy, ctx);
+    android.opengl.EGL14.eglTerminate(dpy);
 
     return maxTextureSize[0];
   }
@@ -1207,20 +1261,20 @@ public class U {
   public static String tryResolveFilePath (final Uri uri) {
     String result = null;
     try {
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT && DocumentsContract.isDocumentUri(UI.getContext(), uri)) {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT && android.provider.DocumentsContract.isDocumentUri(UI.getContext(), uri)) {
         if (isExternalStorageDocument(uri)) {
-          final String docId = DocumentsContract.getDocumentId(uri);
+          final String docId = android.provider.DocumentsContract.getDocumentId(uri);
           final String[] split = docId.split(":", 2);
           final String type = split[0];
           if ("primary".equalsIgnoreCase(type)) {
             result = Environment.getExternalStorageDirectory() + "/" + split[1];
           }
         } else if (isDownloadsDocument(uri)) {
-          final String id = DocumentsContract.getDocumentId(uri);
+          final String id = android.provider.DocumentsContract.getDocumentId(uri);
           final Uri contentUri = ContentUris.withAppendedId(Uri.parse("content://downloads/public_downloads"), StringUtils.parseLong(id));
           result = getDataColumn(UI.getContext(), contentUri, null, null);
         } else if (isMediaDocument(uri)) {
-          final String docId = DocumentsContract.getDocumentId(uri);
+          final String docId = android.provider.DocumentsContract.getDocumentId(uri);
           final String[] split = docId.split(":", 2);
           final String type = split[0];
 
@@ -2396,6 +2450,26 @@ public class U {
     return metadata;
   }
 
+  // Version name of the manifest of the installed APK, read once. A build of all ABIs makes an APK
+  // for each, with its ABI in the version name of its manifest, while all of them share one
+  // BuildConfig with the version name of one of them
+  private static volatile String versionName;
+
+  public static String getVersionName () {
+    String versionName = U.versionName;
+    if (versionName == null) {
+      try {
+        versionName = AppContext.get().getPackageManager()
+          .getPackageInfo(BuildConfig.APPLICATION_ID, 0).versionName;
+      } catch (Throwable ignored) { }
+      if (StringUtils.isEmpty(versionName)) {
+        return BuildConfig.VERSION_NAME;
+      }
+      U.versionName = versionName;
+    }
+    return versionName;
+  }
+
   public static String getApkFingerprint (String algorithm) {
     return getApkFingerprint(algorithm, true);
   }
@@ -2935,10 +3009,85 @@ public class U {
     return pathString;
   }
 
+  public static @Nullable String resolveSharedFilePath (Uri uri) {
+    String path = tryResolveFilePath(Uri.parse(uri.toString()));
+    if (path.startsWith("content://")) {
+      return isInternalUri(Uri.parse(path)) ? null : path;
+    }
+    if (path.startsWith("http://") || path.startsWith("https://")) {
+      return path;
+    }
+    String canonicalPath = getCanonicalPath(path);
+    return canonicalPath == null || isInternalPath(canonicalPath) ? null : canonicalPath;
+  }
+
   public static boolean isInternalUri (Uri uri) {
-    String pathString = normalizeFilePath(uri.getPath());
-    File dir = AppContext.get().getFilesDir();
-    return !StringUtils.isEmpty(pathString) && pathString.startsWith(dir.getPath());
+    Uri parsed = Uri.parse(uri.toString());
+    if ("content".equalsIgnoreCase(parsed.getScheme())) {
+      if (!FileProvider.isOwnUri(parsed)) {
+        return false;
+      }
+      File file = FileProvider.getFileForUri(AppContext.get(), parsed);
+      return file == null || isInternalPath(file.getPath());
+    }
+    return isInternalPath(parsed.getPath());
+  }
+
+  public static boolean isInternalPath (@Nullable String path) {
+    if (StringUtils.isEmpty(path)) {
+      return false;
+    }
+    String canonicalPath = getCanonicalPath(path);
+    if (canonicalPath == null) {
+      return true;
+    }
+    Context context = AppContext.get();
+    if (canonicalPath.startsWith("/proc/") ||
+      isInsideDir(canonicalPath, context.getApplicationInfo().dataDir) ||
+      (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInsideDir(canonicalPath,
+        context.createDeviceProtectedStorageContext().getDataDir().getPath()))) {
+      return true;
+    }
+    // Shared storage folds case and invisible characters of names, e.g. a zero-width joiner
+    String appDir = foldName("/Android/data/" + context.getPackageName() + "/");
+    if (!foldName(canonicalPath + "/").contains(appDir)) {
+      return false;
+    }
+    File tdlibDir = context.getExternalFilesDir(null);
+    String tdlibPath = tdlibDir != null ? getCanonicalPath(tdlibDir.getPath()) : null;
+    // Android 4.2–4.4 also mounts the external storage at /storage/emulated/legacy
+    String legacyRoot = "/storage/emulated/legacy/";
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1 &&
+      Build.VERSION.SDK_INT <= Build.VERSION_CODES.KITKAT && canonicalPath.startsWith(legacyRoot)) {
+      String root = getCanonicalPath(Environment.getExternalStorageDirectory().getPath());
+      if (!StringUtils.isEmpty(root)) {
+        canonicalPath = root + "/" + canonicalPath.substring(legacyRoot.length());
+      }
+    }
+    return StringUtils.isEmpty(tdlibPath) || !isInsideDir(canonicalPath, tdlibPath) ||
+      canonicalPath.length() == tdlibPath.length() ||
+      !TdlibManager.isExternalTdlibFile(canonicalPath.substring(tdlibPath.length() + 1));
+  }
+
+  private static String foldName (String name) {
+    return Build.VERSION.SDK_INT >= Build.VERSION_CODES.N ?
+      android.icu.text.Normalizer2.getNFKCCasefoldInstance().normalize(name) :
+      name.toLowerCase(Locale.ROOT);
+  }
+
+  public static @Nullable String getCanonicalPath (String path) {
+    try {
+      return new File(path).getCanonicalPath();
+    } catch (IOException e) {
+      return null;
+    }
+  }
+
+  private static boolean isInsideDir (String path, @Nullable String dir) {
+    String dirPath = StringUtils.isEmpty(dir) ? null : getCanonicalPath(dir);
+    return !StringUtils.isEmpty(dirPath) &&
+      path.regionMatches(true, 0, dirPath, 0, dirPath.length()) &&
+      (path.length() == dirPath.length() || path.charAt(dirPath.length()) == File.separatorChar);
   }
 
   public static byte[] decodeQuotedPrintable(final byte[] bytes) {
@@ -3419,8 +3568,9 @@ public class U {
         }
         android.content.ClipData.Item clipItem = clipData.getItemAt(0);
         if (clipData.getDescription().hasMimeType("text/html")) {
+          // The description may name HTML that the item doesn't have, e.g. a URI of that type
           String htmlText = clipItem.getHtmlText();
-          return TD.htmlToCharSequence(htmlText);
+          return htmlText != null ? TD.htmlToCharSequence(htmlText) : clipItem.getText();
         } else if (clipData.getDescription().hasMimeType("text/plain")) {
           return clipItem.getText();
         }
@@ -3477,7 +3627,7 @@ public class U {
     if (inputLanguages.isEmpty()) {
       try {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-          LocaleList locales = Resources.getSystem().getConfiguration().getLocales();
+          android.os.LocaleList locales = Resources.getSystem().getConfiguration().getLocales();
           for (int i = 0; i < locales.size(); i++) {
             String code = LocaleUtils.toBcp47Language(locales.get(i));
             if (!StringUtils.isEmpty(code) && !inputLanguages.contains(code))

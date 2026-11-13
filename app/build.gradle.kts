@@ -1,7 +1,6 @@
 @file:Suppress("UnstableApiUsage", "AvoidApplyPluginMethod")
 
 import androidx.baselineprofile.gradle.consumer.BaselineProfileConsumerExtension
-import com.android.build.api.artifact.SingleArtifact
 import com.android.build.api.variant.BuildConfigField
 import com.android.build.api.variant.impl.VariantOutputImpl
 import com.android.build.gradle.tasks.ExternalNativeBuildTask
@@ -14,16 +13,30 @@ import java.util.*
 plugins {
   id("java-toolchain-convention")
   id(libs.plugins.android.application.get().pluginId)
+  id(libs.plugins.androidx.baselineprofile.get().pluginId)
   id("tgx-config")
   id("tgx-module")
 }
 
 val config = tgxConfig.config.get()
 val recorderApplicationId = "ka.soft.tgxr"
-val recorderReleaseVersion = 5
-val recorderReleaseName = "1.3.0"
+val recorderReleaseVersion = 6
+val recorderReleaseName = "1.4.0"
 val isRecorderBuild = config.applicationId == recorderApplicationId
-val generateBaselineProfile = tgxConfig.generateBaselineProfile.get()
+val customGoogleServices = config.googleServicesFile?.let { rootDir.resolve(it) }
+val usedGoogleServices = customGoogleServices ?: file("google-services.json")
+if (customGoogleServices != null && !customGoogleServices.exists()) {
+  fatal("google_services.file: ${customGoogleServices.path} doesn't exist")
+}
+val hasFirebaseMessaging = (customGoogleServices != null || !config.isExperimentalBuild) &&
+  hasGoogleServicesClient(usedGoogleServices, config.applicationId)
+if (!hasFirebaseMessaging && customGoogleServices != null) {
+  val problem = "${customGoogleServices.path} has no client of ${config.applicationId}"
+  if (config.applicationId == "org.thunderdog.challegram") {
+    fatal("$problem: notifications in the app won't work")
+  }
+  logger.warn("$problem: pushes of Firebase are off")
+}
 val useLegacyPackaging = tgxConfig.useLegacyPackaging.get()
 val useLegacyNdk = tgxConfig.useLegacyNdk.get()
 val globalAbiFilters = tgxConfig.abiFilters.get()
@@ -137,9 +150,7 @@ val validateApiTokens = tasks.register<ValidateApiTokensTask>("validateApiTokens
   applicationId.set(
     config.applicationId
   )
-  googleServicesJson.set(layout.projectDirectory.file(
-    "google-services.json"
-  ))
+  googleServicesJson.fileValue(usedGoogleServices)
 }
 val fetchLocalizedStrings = tasks.register<FetchLocalizedStringsTask>("fetchLocalizedStrings") {
   group = "Setup"
@@ -252,6 +263,86 @@ val buildLibvpxTask = tasks.register("buildLibvpx") {
   dependsOn(buildLibvpxTasks.values)
 }
 
+val buildTlottieTasks = Sdk.VARIANTS.values.filter {
+  (it.usesLegacyNdk == useLegacyNdk ||
+    config.build.primaryNdkVersion == config.build.legacyNdkVersion)
+}.flatMap { sdkVariant ->
+  globalAbiFilters.map { abiFilter ->
+    Pair(Pair(sdkVariant.flavor, abiFilter), tasks.register<BuildTlottieTask>(
+      "buildTlottie[${sdkVariant.flavor},${abiFilter}]"
+    ) {
+      group = "Setup"
+      description = "Builds tlottie for ${sdkVariant.flavor} flavor, abi: $abiFilter"
+      // System
+      sdkDir.set(File(config.sdkDir))
+      msys2Dir.set(msys2Directory(config.msys2Dir))
+      ndkVersion.set(android.ndkVersion)
+      hostTag.set(findHostTag())
+      rustDir.set(File(config.rustDir))
+      rustVersion.set(config.build.rustVersion)
+      // Input
+      inputDir.set(layout.projectDirectory.dir(
+        "jni/third_party/tlottie"
+      ))
+      inputSources.from(inputDir.asFileTree.matching {
+        exclude(
+          ".git",
+          "examples",
+          "tools",
+          "*.md"
+        )
+      })
+      sdkFlavor.set(sdkVariant.flavor)
+      abi.set(abiFilter)
+      // Optimizations guided by the profile of drawing on a device of the ABI, see
+      // generateTlottieProfile
+      val profileFile = layout.projectDirectory.file("jni/tlottie/${abiFilter}.profdata")
+      if (profileFile.asFile.exists()) {
+        profile.set(profileFile)
+        profiles.set(layout.projectDirectory.file("jni/tlottie/profiles.properties"))
+      }
+      // Output
+      buildDir.set(layout.buildDirectory.dir(
+        "generated/tgx/tlottie-build/${abiFilter}"
+      ))
+      outputDir.set(layout.buildDirectory.dir(
+        "generated/tgx/tlottie/${sdkVariant.flavor}/${abiFilter}"
+      ))
+      dependsOn(validateGitSetupTask)
+    })
+  }
+}.toMap()
+
+val buildTlottieTask = tasks.register("buildTlottie") {
+  group = "Setup"
+  description = "Builds tlottie for all flavors and abis (${buildTlottieTasks.size} total)"
+  dependsOn(buildTlottieTasks.values)
+}
+
+// Profiles of drawing of tlottie, made by hand on a device of the ABI after updates of tlottie or
+// Rust, e.g. ANDROID_SERIAL=<device> ./gradlew ":app:generateTlottieProfile[arm64-v8a]"
+// -Ptlottie.samples=<folder with emoji, sticker and effect>. x86 and x86_64 have no device to make
+// them on
+val tlottieSamples = providers.gradleProperty("tlottie.samples").map { File(it) }
+listOf("arm64-v8a", "armeabi-v7a").filter { it in globalAbiFilters }.forEach { abiFilter ->
+  tasks.register<GenerateTlottieProfileTask>("generateTlottieProfile[$abiFilter]") {
+    group = "Setup"
+    description = "Makes the profile of drawing of tlottie for $abiFilter on a connected device"
+    sdkDir.set(File(config.sdkDir))
+    ndkVersion.set(config.build.primaryNdkVersion)
+    hostTag.set(findHostTag())
+    rustDir.set(File(config.rustDir))
+    rustVersion.set(config.build.rustVersion)
+    abi.set(abiFilter)
+    inputDir.set(layout.projectDirectory.dir("jni/third_party/tlottie"))
+    runner.set(layout.projectDirectory.file("jni/tlottie/profile.c"))
+    samples.fileProvider(tlottieSamples)
+    profile.set(layout.projectDirectory.file("jni/tlottie/$abiFilter.profdata"))
+    profiles.set(layout.projectDirectory.file("jni/tlottie/profiles.properties"))
+    buildDir.set(layout.buildDirectory.dir("generated/tgx/tlottie-profile/$abiFilter"))
+  }
+}
+
 val buildFfmpegTasks = Sdk.VARIANTS.values.filter {
   (it.usesLegacyNdk == useLegacyNdk || config.build.primaryNdkVersion == config.build.legacyNdkVersion)
 }.flatMap { sdkVariant ->
@@ -352,6 +443,13 @@ android {
     resValue("string", "account_type", "${config.applicationId}.sync.account")
     resValue("string", "content_authority", "${config.applicationId}.sync.provider")
 
+    if (hasFirebaseMessaging && customGoogleServices != null) {
+      googleServicesValues(customGoogleServices, config.applicationId).forEach { (name, value) ->
+        resValue("string", name, value)
+      }
+    }
+    buildConfigBool("FIREBASE_MESSAGING_ENABLED", hasFirebaseMessaging)
+
     buildConfigString("PROJECT_NAME", config.applicationName)
     buildConfigString("SAFETYNET_API_KEY", config.safetyNetToken)
 
@@ -393,7 +491,6 @@ android {
     buildConfigString("NDK_VERSION", ndkVersion)
     buildConfigBool("SHARED_STL", true)
     buildConfigBool("WEBP_ENABLED", true)
-    buildConfigBool("GENERATING_BASELINE_PROFILE", generateBaselineProfile)
 
     // Library versions in BuildConfig.java
 
@@ -533,9 +630,6 @@ android {
         dimension = "SDK"
         isDefault = sdkIndex == Sdk.LATEST
 
-        if (generateBaselineProfile && !variant.isLatest) {
-          matchingFallbacks += Sdk.VARIANTS[Sdk.LATEST]!!.flavor
-        }
         Sdk.VARIANTS.forEach { (subSdkIndex, subVariant) ->
           buildConfigBool("${subVariant.flavor.uppercase()}_FLAVOR", sdkIndex == subSdkIndex)
         }
@@ -600,6 +694,9 @@ android {
             ),
             "FFMPEG_DIR" to layout.buildDirectory.dir(
               "generated/tgx/ffmpeg/${variant.flavor}"
+            ),
+            "TLOTTIE_DIR" to layout.buildDirectory.dir(
+              "generated/tgx/tlottie/${variant.flavor}"
             )
           ).map {
             "-D${it.key}=${it.value.get().asFile.absoluteFile.invariantSeparatorsPath}"
@@ -626,6 +723,14 @@ android {
         }
 
         var extraProguardFileCount = 0
+
+        findExtraFolders(variant).forEach { folderName ->
+          val proguardFile = project.layout.projectDirectory.file("src/$folderName/proguard-rules.pro").asFile
+          if (proguardFile.exists()) {
+            proguardFile(proguardFile)
+            extraProguardFileCount++
+          }
+        }
 
         arrayOf(
           "exoplayer",
@@ -712,6 +817,7 @@ android {
         val buildFfmpegTask = buildFfmpegTasks[key] ?: error("ffmpeg task not found for $key")
         nativeBuildTasks += buildLibvpxTask
         nativeBuildTasks += buildFfmpegTask
+        nativeBuildTasks += buildTlottieTasks[key] ?: error("tlottie task not found for $key")
       }
 
       val buildNativeTask = tasks.register<ValidateNativeBuildTask>(
@@ -842,6 +948,10 @@ android {
       }
 
       variant.buildConfigFields!!.apply {
+        // Build types added by baseline profile plugin, which only tests use
+        put("TEST_HOOKS_ENABLED", BuildConfigField(
+          "boolean", variant.buildType == "nonMinifiedRelease" || variant.buildType == "benchmarkRelease", null
+        ))
         put("RECAPTCHA_VERSION", BuildConfigField(
           "String", "\"$recaptchaVersion\"", null
         ))
@@ -896,39 +1006,38 @@ android {
           "src/google/$folderName/AndroidManifest.xml"
         )
       }
-
-      if (variant.isMinifyEnabled) {
-        val variantName = variant.name.uppercaseFirstChar()
-        val copyTask = project.tasks.register<Copy>(
-          "copy${variantName}MappingFile"
-        ) {
-          description = "Creates a copy of mapping.txt with a build name"
-          from(variant.artifacts.get(SingleArtifact.OBFUSCATION_MAPPING_FILE))
-          into(project.layout.buildDirectory.dir("outputs/mapping/${variant.name}"))
-          val mappingFileName = "${config.outputFileNamePrefix}-$baseVersionName.$baseVersionCode$flavorVersionNameSuffix$buildTypeSuffix"
-          rename("mapping.txt", "$mappingFileName.txt")
-        }
-        project.afterEvaluate {
-          project.tasks.findByName("assemble$variantName")?.finalizedBy(copyTask)
-        }
-      }
     }
   }
 }
 
-if (generateBaselineProfile) {
-  apply(plugin = libs.plugins.androidx.baselineprofile.get().pluginId)
+val hasTests = rootDir.resolve("tests/.git").exists()
+if (hasTests) {
+  apply(plugin = "tgx-tests-app")
+}
 
-  extensions.configure<BaselineProfileConsumerExtension> {
-    mergeIntoMain = true
-    automaticGenerationDuringBuild = false
-    saveInSrc = true
-    warnings.disabledVariants = false
+extensions.configure<BaselineProfileConsumerExtension> {
+  mergeIntoMain = false
+  automaticGenerationDuringBuild = false
+  saveInSrc = true
+  warnings.disabledVariants = false
+  warnings.variantHasNoBaselineProfileDependency = false
+  if (hasTests) {
+    Sdk.VARIANTS.values.filter {
+      it.usesBaselineProfile
+    }.forEach { variant ->
+      variants.create("${variant.flavor}Release").from(project(":tests:baseline-profile"))
+    }
   }
+}
 
-  afterEvaluate {
-    dependencies.add("latestReleaseBaselineProfile", project(":baseline-profile"))
-  }
+// Plugin merges and copies profiles of all release variants, which would leave empty folders in src for variants without profiles
+val variantsWithoutBaselineProfile = Sdk.VARIANTS.values.filter {
+  !it.usesBaselineProfile
+}.map { "${it.flavor.uppercaseFirstChar()}Release" }
+tasks.named { name ->
+  variantsWithoutBaselineProfile.any { name == "merge${it}BaselineProfile" || name == "copy${it}BaselineProfileIntoSrc" }
+}.configureEach {
+  enabled = false
 }
 
 afterEvaluate {
@@ -1002,7 +1111,12 @@ dependencies {
     libs.androidx.exifinterface.latest
   )
   implementation(libs.androidx.biometric)
-  implementation(libs.androidx.palette)
+  flavorImplementation(
+    libs.androidx.palette.legacy,
+    libs.androidx.palette.legacy,
+    libs.androidx.palette.legacy,
+    libs.androidx.palette.latest
+  )
   implementation(libs.androidx.collection)
   implementation(libs.androidx.interpolator)
   // CameraX: https://developer.android.com/jetpack/androidx/releases/camera
@@ -1042,6 +1156,7 @@ dependencies {
   flavorImplementation(
     libs.google.play.services.maps.legacy,
     libs.google.play.services.maps.lollipop,
+    libs.google.play.services.maps.marshmallow,
     libs.google.play.services.maps.latest
   )
   flavorImplementation(
@@ -1155,10 +1270,17 @@ dependencies {
   compileOnly(libs.androidx.room.latest)
   compileOnly(libs.annotations.jsr305)
   compileOnly(libs.annotations.kotlin)
+
+  if (hasTests) {
+    testImplementation(libs.bundles.unit.test)
+    androidTestImplementation(project(":tests:core"))
+  }
 }
 
 if (!config.isExperimentalBuild) {
-  apply(plugin = libs.plugins.google.services.get().pluginId)
+  if (customGoogleServices == null) {
+    apply(plugin = libs.plugins.google.services.get().pluginId)
+  }
   if (config.isHuaweiBuild) {
     apply(plugin = libs.huawei.agconnect.get().group)
   }
