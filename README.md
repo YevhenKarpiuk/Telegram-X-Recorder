@@ -1,20 +1,43 @@
-# [Telegram X](https://play.google.com/store/apps/details?id=org.thunderdog.challegram) — a slick experimental Telegram client based on [TDLib](https://core.telegram.org/tdlib).
+# Telegram X Recorder
 
-![Telegram X](/images/feature.png)
+Неофициальный форк [Telegram X](https://github.com/TGX-Android/Telegram-X) для Android со встроенной записью голосовых звонков.
 
-This is the complete source code and the build instructions for the official alternative Android client for the Telegram messenger, based on the [Telegram API](https://core.telegram.org/api) and the [MTProto](https://core.telegram.org/mtproto) secure protocol via [TDLib](https://github.com/TGX-Android/tdlib).
+**[Скачать последнюю версию](https://github.com/YevhenKarpiuk/Telegram-X-Recorder/releases/latest)**
 
-* [**Telegram X** on Google Play](http://play.google.com/store/apps/details?id=org.thunderdog.challegram) ([subscribe to beta](https://play.google.com/apps/testing/org.thunderdog.challegram))
-* [APKs and Build Info](https://t.me/tgx_log)
-* [Bot to verify APK hash](https://t.me/tgx_bot)
+Текущая версия: **Recorder 1.3.0** на основе Telegram X 0.29.1.1819.
 
-<details>
-<summary>Other sources</summary>
+## Возможности
 
-* [**Telegram X** on Huawei AppGallery](https://appgallery.huawei.com/app/C101754199)
-* [**GitHub Releases**](https://github.com/TGX-Android/Telegram-X/releases)
+* Запись обеих сторон личного звонка прямо в приложении, без root и без микрофона на громкой связи.
+* Три режима сохранения: общая дорожка и отдельные дорожки собеседников, только общая или только отдельные.
+* Пауза и продолжение записи во время звонка.
+* Восстановление записи, если приложение или звонок прервались.
+* Список записей с воспроизведением, экспортом и удалением.
+* Отдельный пакет `ka.soft.tgxr`: ставится рядом с официальным Telegram X и не мешает ему.
 
-</details>
+## Какой APK выбрать
+
+В каждом [релизе](https://github.com/YevhenKarpiuk/Telegram-X-Recorder/releases) три APK, каждый для ARM32 и ARM64:
+
+| Android | Файл |
+| --- | --- |
+| 13 и новее | `Telegram-X-Recorder-vX.Y.Z.apk` |
+| 10–12 | `Telegram-X-Recorder-vX.Y.Z-QRS.apk` |
+| 7–9 | `Telegram-X-Recorder-vX.Y.Z-nougatOreoPie.apk` |
+
+Рядом лежат `.sha256` и общий `SHA256SUMS.txt` для проверки. Новая версия ставится поверх старой, удалять Recorder не нужно.
+
+## Устройство репозитория
+
+* `main` — опубликованный релиз, каждая версия отмечена тегом `tgxr-vX.Y.Z`.
+* `dev` — разработка. Обновления Telegram X вливаются сюда из [TGX-Android/Telegram-X](https://github.com/TGX-Android/Telegram-X), после проверки `main` догоняет `dev`.
+* Хуки записи звука в библиотеке звонков лежат в форке [YevhenKarpiuk/tgcalls](https://github.com/YevhenKarpiuk/tgcalls) (ветка `recorder`), он подключён сабмодулем.
+
+Сборка такая же, как у Telegram X (инструкция ниже). Идентификатор и имя приложения задаются в `local.properties`: `app.id=ka.soft.tgxr`, `app.name=Telegram X Recorder`.
+
+Код записи звонков распространяется на тех же условиях, что и Telegram X: GNU GPL v3.0. Ниже сохранена оригинальная документация Telegram X.
+
+---
 
 ## Build instructions
 
