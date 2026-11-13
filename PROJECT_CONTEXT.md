@@ -3,6 +3,11 @@
 ## Цель и результат
 Recorder 1.3.0 на Telegram X 0.29.1.1819 опубликован. main, call-recording-dev, call-recording и upgrade/recorder-tgx-1819 содержат проверенный код интеграции 18a774d8. Перенос выполнялся fast-forward без force push. Тег tgxr-v1.3.0 сохранён на 07294c70; последующие изменения касаются документации.
 
+## Recorder 1.4.0 (в работе, dev)
+- 2026-11-13: dev смержен с Telegram X 0.29.2.1829-beta (7fe047c8), tgcalls subtree обновлён до TGX production 97c1537a с теми же recorder-хуками. Foreground-логика звонков теперь upstream-овская (CallForegroundStateMachine удалён); настройки записи — в Настройки → Уведомления → Звонки.
+- Нужен Rust 1.99.1 (tlottie): rust.dir в local.properties, установлен в builds/tools/rust. Flavor tens переименован upstream в nop.
+- Собраны Debug и Release latest/nop/qrs 1.4.0, 27 unit tests прошли, APK проверены. main/тег/релиз не обновлялись до OK владельца. Подробности: docs/TGX_1829_RECORDER_UPGRADE.md.
+
 ## Реализация
 - Сохранены package ka.soft.tgxr, прежняя подпись, формат записей, PCM hooks, режимы записи, пауза, восстановление, воспроизведение и экспорт.
 - Upstream c26c0efa; Recorder tgcalls 29e43315, WebRTC 7b03082. Зависимости закреплены в Git.
