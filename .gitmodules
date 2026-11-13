@@ -108,11 +108,6 @@
 	url = https://github.com/TGX-Android/webrtc
 	shallow = true
 	branch = production
-[submodule "tgcalls"]
-	path = app/jni/tgvoip/third_party/tgcalls
-	url = https://github.com/YevhenKarpiuk/tgcalls.git
-	shallow = true
-	branch = recorder
 [submodule "libevent"]
 	path = app/jni/tgvoip/third_party/libevent
 	url = https://github.com/TGX-Android/libevent
