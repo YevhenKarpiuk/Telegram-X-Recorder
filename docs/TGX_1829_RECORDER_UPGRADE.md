@@ -78,8 +78,29 @@ Unit tests: `CallRecordingRepositoryTest` 24, `ApplicationIdentityTest` 3 — 27
 
 Пути: `app/build/outputs/apk/{latest/debug,latest/release,nop/release,qrs/release}/Telegram-X-Recorder-v1.4.0*.apk`. Все versionCode выше 1.3.0 (1819300–1819500) — установка поверх без удаления.
 
+## Исправление Bluetooth (18.11.2026, `e7dbd541`)
+
+По отзыву владельца после установки: на Android 12+ записи не проигрывались через Bluetooth, при звонке с подключённой гарнитурой Bluetooth не выбирался по умолчанию, а во время набора устройство переключалось туда-сюда. Ошибка унаследована от Telegram X (та же логика в 1.3.0 и upstream 1829).
+
+- `TGCallService`: `clearCommunicationDevice()` в конце звонка (сразу и в отложенной ветке `releaseAudioFocus`, а также при снятии конфигурации), иначе Bluetooth SCO оставался выбранным и медиа в гарнитуру не шло.
+- При старте звонка на Android 12+ подключённая Bluetooth-гарнитура (`TYPE_BLUETOOTH_SCO`/`TYPE_BLE_HEADSET`) выбирается по умолчанию.
+- Запрошенное устройство запоминается; 3 секунды, пока оно доступно, сообщения системы о другом устройстве не записываются в `CallSettings` (раньше это создавало обратную связь и перебивало выбор).
+- `TYPE_BLUETOOTH_A2DP` убран из фильтров устройства связи; listener на main executor.
+- `CallRecordingDetailsController` перед проигрыванием снимает оставшееся устройство связи.
+
+Пересборка: **BUILD SUCCESSFUL in 9m 28s**, 27 unit tests прошли, проверка APK пройдена (`builds/tgx-1829-bt-apk-verification.log`). Владелец проверил на телефоне: всё в порядке. Финальные APK:
+
+| APK | versionCode | Размер | SHA-256 |
+| --- | ---: | ---: | --- |
+| `Telegram-X-Recorder-v1.4.0-debug.apk` | 1829000 | 129460014 | `e4c8c9e48a03d4f3fa7c9dc87f76954813a4b01dbfe109712c555eeeb7d620ac` |
+| `Telegram-X-Recorder-v1.4.0.apk` | 1829500 | 82552162 | `06ab3ecc89e2a15b1efc58a8a81ad28f78dde8198b13d59f2778fa8b5a3e8c8e` |
+| `Telegram-X-Recorder-v1.4.0-nougatOreoPie.apk` | 1829300 | 77744452 | `6982e1fd53e33f127fb116964eddd5043ed39bf9037c3c1daa5b5d5a6a92393b` |
+| `Telegram-X-Recorder-v1.4.0-QRS.apk` | 1829400 | 84132312 | `f09a4bb05ad51cdcc284530f227462db73ff9330aaa12b7bb8ddfbf89c03b82f` |
+
+Таблица выше в разделе «APK» относится к первой сборке `cb017a2d`.
+
 ## Не проверено
 
 Реальные звонки на устройстве (обе стороны в записи, три режима, пауза/продолжение, восстановление, воспроизведение, экспорт) и обновление поверх 1.3.0 с сохранением данных. Особенно стоит проверить: ответ на входящий из уведомления при закрытом приложении и автозапись — foreground-логика теперь upstream-овская.
 
-Публикация (fast-forward `main`, тег `tgxr-v1.4.0`, GitHub Release) не выполнялась — ждёт решения владельца.
+Владелец разрешил публикацию 18.11.2026: `main` переведён fast-forward на код APK, тег `tgxr-v1.4.0`, GitHub Release с тремя Release APK — см. [TGXR_1.4.0_RELEASE.md](TGXR_1.4.0_RELEASE.md).

@@ -4,7 +4,7 @@
 
 **[Скачать последнюю версию](https://github.com/YevhenKarpiuk/Telegram-X-Recorder/releases/latest)**
 
-Текущая версия: **Recorder 1.3.0** на основе Telegram X 0.29.1.1819.
+Текущая версия: **Recorder 1.4.0** на основе Telegram X 0.29.2.1829-beta.
 
 ## Возможности
 
