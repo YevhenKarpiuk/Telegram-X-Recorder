@@ -43,6 +43,7 @@ import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
 import android.os.Process;
+import android.os.SystemClock;
 import android.os.Vibrator;
 import android.telephony.TelephonyManager;
 import android.text.SpannableString;
@@ -98,7 +99,6 @@ import java.lang.ref.WeakReference;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.List;
-import java.util.concurrent.Executors;
 
 import me.vkryl.core.StringUtils;
 import me.vkryl.core.lambda.Filter;
@@ -486,8 +486,10 @@ public class TGCallService extends Service implements
         if (communicationDeviceChangedListener == null) {
           communicationDeviceChangedListener = (AudioManager.OnCommunicationDeviceChangedListener) device -> UI.post(this::notifyAudioSettingsChanged);
         }
-        am.addOnCommunicationDeviceChangedListener(Executors.newSingleThreadExecutor(), (AudioManager.OnCommunicationDeviceChangedListener) communicationDeviceChangedListener);
-        notifyAudioSettingsChanged();
+        am.addOnCommunicationDeviceChangedListener(getMainExecutor(), (AudioManager.OnCommunicationDeviceChangedListener) communicationDeviceChangedListener);
+        if (!selectBluetoothByDefault(am)) {
+          notifyAudioSettingsChanged();
+        }
       } else {
         if (btAdapter != null && btAdapter.isEnabled()) {
           //noinspection MissingPermission
@@ -514,6 +516,7 @@ public class TGCallService extends Service implements
     cpuWakelock.release();
     final AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
     boolean isBtHeadsetConnected = this.isBtHeadsetConnected;
+    clearCommunicationDevice(am);
     RunnableBool disconnectBt = Build.VERSION.SDK_INT < Build.VERSION_CODES.S && isBtHeadsetConnected ? (delayed) -> {
       am.stopBluetoothSco();
       Log.d(Log.TAG_VOIP, "AudioManager.stopBluetoothSco (in onDestroy), delayed: %b", delayed);
@@ -535,6 +538,7 @@ public class TGCallService extends Service implements
               if (disconnectBt != null) {
                 disconnectBt.runWithBool(true);
               }
+              clearCommunicationDevice(am);
               Log.d(Log.TAG_VOIP, "AudioManager.setMode(AudioManager.MODE_NORMAL) (in onDestroy, delayed)");
               am.setMode(AudioManager.MODE_NORMAL);
             } catch (Throwable ignored) { }
@@ -671,6 +675,62 @@ public class TGCallService extends Service implements
 
   private int lastAudioMode;
 
+  // Route requested by setAudioMode on Android 12+. Switching to a device, e.g. Bluetooth SCO, takes
+  // a moment, while the system reports the previous device: such reports must not be written back
+  // into CallSettings, otherwise they override the requested route (flip-flopping while dialing)
+  private static final int NO_DEVICE_REQUESTED = -1;
+  private static final long COMMUNICATION_DEVICE_SWITCH_TIMEOUT_MS = 3000;
+  private int requestedCommunicationDeviceType = NO_DEVICE_REQUESTED;
+  private long requestedCommunicationDeviceTime;
+
+  private static boolean isBluetoothCommunicationDevice (android.media.AudioDeviceInfo device) {
+    int type = device.getType();
+    return type == android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+      type == android.media.AudioDeviceInfo.TYPE_BLE_HEADSET;
+  }
+
+  private boolean selectBluetoothByDefault (AudioManager am) {
+    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+      return false;
+    }
+    boolean hasBluetooth = false;
+    for (android.media.AudioDeviceInfo device : am.getAvailableCommunicationDevices()) {
+      if (isBluetoothCommunicationDevice(device)) {
+        hasBluetooth = true;
+        break;
+      }
+    }
+    if (!hasBluetooth) {
+      return false;
+    }
+    isBtHeadsetConnected = true;
+    CallSettings settings = getCallSettings();
+    if (settings != null && settings.getSpeakerMode() != CallSettings.SPEAKER_MODE_EARPIECE) {
+      // A route has been chosen for this call already
+      return false;
+    }
+    Log.d(Log.TAG_VOIP, "Bluetooth headset is connected: routing the call to it");
+    if (settings != null) {
+      settings.setSpeakerMode(CallSettings.SPEAKER_MODE_BLUETOOTH);
+    }
+    if (lastAudioMode != CallSettings.SPEAKER_MODE_BLUETOOTH) {
+      setAudioMode(CallSettings.SPEAKER_MODE_BLUETOOTH);
+    }
+    return true;
+  }
+
+  private void clearCommunicationDevice (AudioManager am) {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      requestedCommunicationDeviceType = NO_DEVICE_REQUESTED;
+      try {
+        am.clearCommunicationDevice();
+        Log.d(Log.TAG_VOIP, "AudioManager.clearCommunicationDevice()");
+      } catch (Throwable t) {
+        Log.e(Log.TAG_VOIP, "Unable to clear communication device", t);
+      }
+    }
+  }
+
   private void setAudioMode (int mode) {
     Log.d(Log.TAG_VOIP, "setAudioMode: %s", mode == CallSettings.SPEAKER_MODE_BLUETOOTH ? "SPEAKER_MODE_BLUETOOTH" : mode == CallSettings.SPEAKER_MODE_EARPIECE ? "SPEAKER_MODE_NONE" : mode == CallSettings.SPEAKER_MODE_SPEAKER_DEFAULT ? "SPEAKER_MODE_SPEAKER_DEFAULT" : Integer.toString(mode));
     lastAudioMode = mode;
@@ -693,7 +753,6 @@ public class TGCallService extends Service implements
           filter = device -> switch (device.getType()) {
             case
               android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
-              android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
               android.media.AudioDeviceInfo.TYPE_BLE_HEADSET/*,
               android.media.AudioDeviceInfo.TYPE_BLE_SPEAKER,
               android.media.AudioDeviceInfo.TYPE_BLE_BROADCAST*/ ->
@@ -732,7 +791,6 @@ public class TGCallService extends Service implements
             filter = device -> switch (device.getType()) {
               case
                 android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
-                android.media.AudioDeviceInfo.TYPE_BLUETOOTH_A2DP,
                 android.media.AudioDeviceInfo.TYPE_BLE_HEADSET/*,
               android.media.AudioDeviceInfo.TYPE_BLE_SPEAKER,
               android.media.AudioDeviceInfo.TYPE_BLE_BROADCAST*/ ->
@@ -755,6 +813,8 @@ public class TGCallService extends Service implements
           }
         }
       }
+      requestedCommunicationDeviceType = selectedAudioDevice != null ? selectedAudioDevice.getType() : NO_DEVICE_REQUESTED;
+      requestedCommunicationDeviceTime = SystemClock.uptimeMillis();
       if (selectedAudioDevice != null) {
         am.setCommunicationDevice(selectedAudioDevice);
       } else {
@@ -935,6 +995,7 @@ public class TGCallService extends Service implements
 
       Log.i(Log.TAG_VOIP, "Unconfiguring device from call...");
 
+      clearCommunicationDevice(am);
       am.setMode(AudioManager.MODE_NORMAL);
       // Audio focus changed in the onDestroy
 
@@ -1702,6 +1763,22 @@ public class TGCallService extends Service implements
         }
       }
       android.media.AudioDeviceInfo deviceInfo = am.getCommunicationDevice();
+      if (requestedCommunicationDeviceType != NO_DEVICE_REQUESTED &&
+        (deviceInfo == null || deviceInfo.getType() != requestedCommunicationDeviceType) &&
+        SystemClock.uptimeMillis() - requestedCommunicationDeviceTime < COMMUNICATION_DEVICE_SWITCH_TIMEOUT_MS) {
+        boolean isRequestedAvailable = false;
+        for (android.media.AudioDeviceInfo audioDevice : audioDevices) {
+          if (audioDevice.getType() == requestedCommunicationDeviceType) {
+            isRequestedAvailable = true;
+            break;
+          }
+        }
+        if (isRequestedAvailable) {
+          Log.d(Log.TAG_VOIP, "Ignoring communication device %s while switching to %d",
+            deviceInfo != null ? deviceInfo.getType() : "null", requestedCommunicationDeviceType);
+          return;
+        }
+      }
       mode = CallSettings.SPEAKER_MODE_EARPIECE;
       if (deviceInfo != null) {
         switch (deviceInfo.getType()) {

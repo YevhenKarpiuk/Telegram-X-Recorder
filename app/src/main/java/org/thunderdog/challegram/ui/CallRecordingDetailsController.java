@@ -284,6 +284,7 @@ public final class CallRecordingDetailsController
       return;
     }
     releasePlayer();
+    releaseCommunicationRoute();
     File source = trackFile(variant);
     if (source == null || !source.isFile()) return;
     if (!requestAudioFocus()) {
@@ -323,6 +324,19 @@ public final class CallRecordingDetailsController
     } catch (Throwable t) {
       releasePlayer();
       Toast.makeText(context, R.string.CallRecordingPlaybackFailed, Toast.LENGTH_SHORT).show();
+    }
+  }
+
+  private void releaseCommunicationRoute () {
+    // A communication device left selected after a call, e.g. Bluetooth SCO, keeps the headset in
+    // the call profile, where media playback is silent
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+      AudioManager am = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+      if (am != null && am.getCommunicationDevice() != null) {
+        try {
+          am.clearCommunicationDevice();
+        } catch (Throwable ignored) { }
+      }
     }
   }
 
